@@ -17,6 +17,7 @@ menu() {
 5) Censorcheck   - DNS resolvers (DoH/DoT) + доступность сайтов, DPI
 6) Bench.sh      - CPU/диск (teddysun)
 7) sysbench CPU  - однопоточный CPU-тест
+8) Globalping    - доступность ЭТОГО сервера с проверочных нод в РФ
 0) Все по очереди
 EOF
 }
@@ -29,9 +30,25 @@ cmd_5() { run "Censorcheck (DPI mode)" "bash <(wget -qO- https://github.com/vern
 cmd_6() { run "Bench.sh (Teddysun)" "wget -qO- bench.sh | bash"; }
 cmd_7() { run "sysbench CPU" "command -v sysbench >/dev/null || apt install -y sysbench; sysbench cpu run --threads=1"; }
 
+cmd_8() {
+  echo -e "\n########## Globalping (доступность этого сервера из РФ) ##########\n"
+  if ! command -v globalping >/dev/null; then
+    curl -s https://packagecloud.io/install/repositories/jsdelivr/globalping/script.deb.sh | bash >/dev/null 2>&1
+    apt install -y globalping >/dev/null 2>&1
+  fi
+  MY_IP=$(curl -s https://api.ipify.org || curl -s ifconfig.me)
+  echo "Проверяемый IP этого сервера: ${MY_IP}"
+  echo
+  echo "--- ping с 5 нод в РФ ---"
+  globalping ping "$MY_IP" from Russia --limit 5
+  echo
+  echo "--- mtr с 3 нод в РФ (видно, на каком хопе рвётся) ---"
+  globalping mtr "$MY_IP" from Russia --limit 3
+}
+
 case "$1" in
-  1|2|3|4|5|6|7) "cmd_$1" ;;
-  все|all|0|"") for i in 1 2 3 4 5 6 7; do "cmd_$i"; done ;;
+  1|2|3|4|5|6|7|8) "cmd_$1" ;;
+  все|all|0|"") for i in 1 2 3 4 5 6 7 8; do "cmd_$i"; done ;;
   menu|-h|--help) menu ;;
   *) echo "Неизвестный аргумент"; menu ;;
 esac
