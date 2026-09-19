@@ -1,10 +1,25 @@
 #!/usr/bin/env bash
 # Полный чек-лист для проверки VPS перед/после покупки
 # Запуск:
-#   bash vps-check.sh              -> всё по очереди
-#   bash vps-check.sh 3            -> только пункт 3
-#   bash vps-check.sh 2,4,5-7      -> пункты 2, 4, 5, 6, 7
-#   bash vps-check.sh menu         -> список пунктов
+#   bash vps-check.sh                      -> пункты 1-10 по очереди (без 11 и 12)
+#   bash vps-check.sh 3                    -> только пункт 3
+#   bash vps-check.sh 2,4,5-7              -> пункты 2, 4, 5, 6, 7
+#   bash vps-check.sh -o report.txt 9      -> тот же запуск, плюс сохранить вывод в файл
+#   bash vps-check.sh menu                 -> список пунктов
+
+MIN_ITEM=1
+MAX_ITEM=12
+
+# ---------- вывод в файл (флаг -o/--output перед номером пункта) ----------
+OUTPUT_FILE=""
+if [ "$1" = "-o" ] || [ "$1" = "--output" ]; then
+  OUTPUT_FILE="$2"
+  shift 2
+fi
+if [ -n "$OUTPUT_FILE" ]; then
+  exec > >(tee "$OUTPUT_FILE") 2>&1
+  echo "Вывод дублируется в файл: $OUTPUT_FILE"
+fi
 
 run() {
   echo -e "\n########## $1 ##########\n"
@@ -21,13 +36,16 @@ menu() {
 6)  Bench.sh        - CPU/диск (teddysun)
 7)  sysbench CPU    - однопоточный CPU-тест
 8)  Globalping      - доступность ЭТОГО сервера с проверочных нод в РФ (ping+mtr)
-9)  Security Audit  - SSH-конфиг, firewall, fail2ban/crowdsec, автообновления, открытые порты
+9)  Security Audit  - SSH-конфиг, firewall, fail2ban/crowdsec, автообновления, открытые порты + оценка
 10) Disk & FS       - свободное место, inode, ошибки файловой системы
 11) SSL Check       - срок действия сертификата домена (нужен аргумент-домен)
 12) Geekbench       - только Geekbench (без fio/iperf3), для сравнения CPU между хостерами
-0)  Все по очереди
+0)  Все по очереди (пункты 1-10; 11 и 12 пропускаются — см. ниже)
 
 Диапазоны: bash vps-check.sh 2,4,5-7
+Вывод в файл: bash vps-check.sh -o report.txt 9
+11 (SSL) нужен домен и не входит в общий прогон: bash vps-check.sh 11 example.com
+12 (Geekbench) не входит в общий прогон — CPU уже покрыт пунктом 1: bash vps-check.sh 12
 EOF
 }
 
@@ -58,64 +76,128 @@ cmd_8() {
 
 # ---------- 9. Security Audit ----------
 # Только чтение: ничего не меняет и не устанавливает, кроме
-# отсутствующих утилит для самой проверки.
+# отсутствующих утилит для самой проверки. В конце — оценка 0-100.
 cmd_9() {
   echo -e "\n########## Security Audit (только чтение) ##########\n"
 
-  echo "=== SSH-конфигурация (/etc/ssh/sshd_config) ==="
-  if [ -r /etc/ssh/sshd_config ]; then
+  SCORE=100
+  deduct() {
+    SCORE=$((SCORE - $1))
+    echo "  [-$1] $2"
+  }
+
+  echo "=== SSH-конфигурация ==="
+  # Debian/Ubuntu подключают /etc/ssh/sshd_config.d/*.conf директивой Include
+  # обычно в начале основного файла — то есть более поздние совпадения в
+  # sshd_config.d/ и в самом sshd_config переопределяют более ранние.
+  # Склеиваем файлы в этом порядке и берём последнее совпадение.
+  SSHD_FILES=()
+  [ -d /etc/ssh/sshd_config.d ] && SSHD_FILES+=(/etc/ssh/sshd_config.d/*.conf)
+  [ -r /etc/ssh/sshd_config ] && SSHD_FILES+=(/etc/ssh/sshd_config)
+
+  if [ ${#SSHD_FILES[@]} -gt 0 ]; then
     get_ssh() {
-      val=$(grep -iE "^\s*$1\s+" /etc/ssh/sshd_config 2>/dev/null | tail -1 | awk '{print $2}')
-      echo "${val:-не задано (по умолчанию у sshd)}"
+      val=$(cat "${SSHD_FILES[@]}" 2>/dev/null | grep -iE "^\s*$1\s+" | tail -1 | awk '{print $2}')
+      echo "${val:-не задано}"
     }
-    echo "PermitRootLogin:        $(get_ssh PermitRootLogin)"
-    echo "PasswordAuthentication: $(get_ssh PasswordAuthentication)"
-    echo "Port:                   $(get_ssh Port)"
-    echo "PubkeyAuthentication:   $(get_ssh PubkeyAuthentication)"
+    ROOT_LOGIN=$(get_ssh PermitRootLogin)
+    PASS_AUTH=$(get_ssh PasswordAuthentication)
+    SSH_PORT=$(get_ssh Port)
+    PUBKEY_AUTH=$(get_ssh PubkeyAuthentication)
+
+    echo "PermitRootLogin:        $ROOT_LOGIN"
+    echo "PasswordAuthentication: $PASS_AUTH"
+    echo "Port:                   ${SSH_PORT:-22 (по умолчанию)}"
+    echo "PubkeyAuthentication:   $PUBKEY_AUTH"
+    echo "(учтены основной sshd_config и /etc/ssh/sshd_config.d/*.conf)"
+
+    case "$ROOT_LOGIN" in
+      yes) deduct 20 "root может логиниться по SSH напрямую (PermitRootLogin yes)" ;;
+    esac
+    case "$PASS_AUTH" in
+      yes|"не задано") deduct 20 "разрешён вход по паролю (PasswordAuthentication yes/не задано — по умолчанию у большинства систем это yes)" ;;
+    esac
   else
-    echo "Нет доступа к /etc/ssh/sshd_config"
+    echo "Нет доступа к sshd_config и sshd_config.d/ — SSH-часть аудита пропущена."
+    deduct 10 "не удалось прочитать конфиг SSH (запусти от root для полной проверки)"
   fi
 
   echo
   echo "=== Firewall ==="
+  FW_ACTIVE=0
   if command -v ufw >/dev/null; then
     echo "--- ufw ---"
-    ufw status verbose 2>/dev/null || echo "ufw установлен, но статус получить не удалось (нужен root?)"
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+      ufw status verbose 2>/dev/null
+      FW_ACTIVE=1
+    else
+      echo "ufw установлен, но неактивен (или нет прав посмотреть статус)"
+    fi
   fi
   if command -v firewall-cmd >/dev/null; then
     echo "--- firewalld ---"
-    firewall-cmd --state 2>/dev/null
-    firewall-cmd --list-all 2>/dev/null
+    if firewall-cmd --state 2>/dev/null | grep -q running; then
+      firewall-cmd --list-all 2>/dev/null
+      FW_ACTIVE=1
+    else
+      echo "firewalld установлен, но не запущен"
+    fi
   fi
-  if command -v iptables >/dev/null && ! command -v ufw >/dev/null && ! command -v firewall-cmd >/dev/null; then
+  if command -v iptables >/dev/null && [ "$FW_ACTIVE" -eq 0 ]; then
     echo "--- iptables (сырые правила) ---"
-    iptables -L -n 2>/dev/null || echo "нет доступа к iptables (нужен root?)"
+    RULES=$(iptables -L -n 2>/dev/null)
+    echo "$RULES"
+    # если есть хоть одно ACCEPT/DROP/REJECT правило кроме политики по умолчанию — считаем, что что-то настроено
+    if echo "$RULES" | grep -qE "^(ACCEPT|DROP|REJECT)"; then
+      FW_ACTIVE=1
+    fi
   fi
-  if ! command -v ufw >/dev/null && ! command -v firewall-cmd >/dev/null && ! command -v iptables >/dev/null; then
-    echo "Не найдено ни ufw, ни firewalld, ни iptables."
+  if [ "$FW_ACTIVE" -eq 0 ]; then
+    echo "Активный firewall не обнаружен (ufw/firewalld неактивны, осмысленных правил iptables нет)."
+    deduct 25 "нет активного firewall"
   fi
 
   echo
   echo "=== Защита от брутфорса ==="
-  if command -v fail2ban-client >/dev/null; then
-    echo "fail2ban установлен. Активные jail'ы:"
-    fail2ban-client status 2>/dev/null || echo "не удалось получить статус (нужен root?)"
-  elif command -v cscli >/dev/null; then
-    echo "CrowdSec установлен."
+  F2B_ACTIVE=0
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    echo "fail2ban запущен (systemctl is-active). Активные jail'ы:"
+    fail2ban-client status 2>/dev/null || echo "(команда fail2ban-client недоступна для чтения статуса)"
+    F2B_ACTIVE=1
+  elif command -v fail2ban-client >/dev/null; then
+    echo "fail2ban установлен, но НЕ запущен (systemctl is-active вернул false)."
+  elif command -v cscli >/dev/null && systemctl is-active --quiet crowdsec 2>/dev/null; then
+    echo "CrowdSec установлен и запущен."
     cscli metrics 2>/dev/null | head -20
+    F2B_ACTIVE=1
+  elif command -v cscli >/dev/null; then
+    echo "CrowdSec установлен, но сервис не запущен."
   else
-    echo "Fail2ban/CrowdSec не найдены — SSH ничем не защищён от подбора пароля/брутфорса."
+    echo "Fail2ban/CrowdSec не найдены."
+  fi
+  if [ "$F2B_ACTIVE" -eq 0 ]; then
+    deduct 15 "нет активной защиты от брутфорса (fail2ban/CrowdSec не запущены)"
   fi
 
   echo
   echo "=== Автообновления безопасности ==="
+  UPD_OK=0
   if dpkg -s unattended-upgrades >/dev/null 2>&1; then
     echo "unattended-upgrades установлен."
-    systemctl is-enabled unattended-upgrades 2>/dev/null
+    if systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
+      echo "и включён (systemctl is-enabled)."
+      UPD_OK=1
+    else
+      echo "но не включён в systemd."
+    fi
   elif command -v dnf >/dev/null && rpm -q dnf-automatic >/dev/null 2>&1; then
     echo "dnf-automatic установлен."
+    UPD_OK=1
   else
-    echo "Автообновления безопасности не настроены (unattended-upgrades/dnf-automatic не найдены)."
+    echo "Автообновления безопасности не настроены."
+  fi
+  if [ "$UPD_OK" -eq 0 ]; then
+    deduct 10 "автообновления безопасности не настроены/не включены"
   fi
 
   echo
@@ -127,6 +209,15 @@ cmd_9() {
   else
     echo "Нет ни ss, ни netstat — установи iproute2 (apt install -y iproute2), чтобы увидеть список портов."
   fi
+
+  echo
+  echo "=== Итог ==="
+  [ "$SCORE" -lt 0 ] && SCORE=0
+  if [ "$SCORE" -ge 80 ]; then VERDICT="хорошо — базовая защита на месте"
+  elif [ "$SCORE" -ge 50 ]; then VERDICT="средне — есть незакрытые дыры, стоит поправить"
+  else VERDICT="плохо — сервер в дефолтном состоянии, легко ломается автоматическим сканированием"
+  fi
+  echo "Оценка: ${SCORE}/100 — ${VERDICT}"
 }
 
 # ---------- 10. Disk & Filesystem ----------
@@ -179,7 +270,7 @@ cmd_11() {
     || echo "Не удалось получить сертификат (сайт недоступен по 443 или openssl не установлен)."
 }
 
-# ---------- разбор аргументов вида 2,4,5-7 ----------
+# ---------- разбор аргументов вида 2,4,5-7 (с проверкой границ 1-12) ----------
 expand_selection() {
   input="$1"
   result=""
@@ -188,10 +279,20 @@ expand_selection() {
     if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
       start="${BASH_REMATCH[1]}"
       end="${BASH_REMATCH[2]}"
+      if [ "$start" -gt "$end" ]; then
+        echo "Пропускаю некорректный диапазон $part (начало больше конца)" >&2
+        continue
+      fi
+      [ "$start" -lt "$MIN_ITEM" ] && { echo "Диапазон $part выходит за $MIN_ITEM-$MAX_ITEM, обрезаю до $MIN_ITEM" >&2; start=$MIN_ITEM; }
+      [ "$end" -gt "$MAX_ITEM" ] && { echo "Диапазон $part выходит за $MIN_ITEM-$MAX_ITEM, обрезаю до $MAX_ITEM" >&2; end=$MAX_ITEM; }
       for ((i=start; i<=end; i++)); do
         result="$result $i"
       done
     elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      if [ "$part" -lt "$MIN_ITEM" ] || [ "$part" -gt "$MAX_ITEM" ]; then
+        echo "Пункта $part не существует (доступны $MIN_ITEM-$MAX_ITEM), пропускаю" >&2
+        continue
+      fi
       result="$result $part"
     fi
   done
@@ -213,11 +314,7 @@ case "$ARG" in
     ;;
   *[0-9]*)
     for n in $(expand_selection "$ARG"); do
-      if declare -f "cmd_$n" >/dev/null; then
-        "cmd_$n"
-      else
-        echo "Пункта $n не существует, см. bash vps-check.sh menu"
-      fi
+      "cmd_$n"
     done
     ;;
   *)
