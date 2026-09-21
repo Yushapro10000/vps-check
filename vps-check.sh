@@ -1,30 +1,76 @@
 #!/usr/bin/env bash
 # Полный чек-лист для проверки VPS перед/после покупки
 # Запуск:
-#   bash vps-check.sh                      -> пункты 1-10 по очереди (без 11 и 12)
+#   bash vps-check.sh                      -> пункты 1-10, 13 по очереди (без 11 и 12)
 #   bash vps-check.sh 3                    -> только пункт 3
 #   bash vps-check.sh 2,4,5-7              -> пункты 2, 4, 5, 6, 7
 #   bash vps-check.sh -o report.txt 9      -> тот же запуск, плюс сохранить вывод в файл
 #   bash vps-check.sh menu                 -> список пунктов
 
 MIN_ITEM=1
-MAX_ITEM=12
+MAX_ITEM=13
 
-# ---------- вывод в файл (флаг -o/--output перед номером пункта) ----------
+# ---------- разбор -o/--output (в любой позиции) ----------
 OUTPUT_FILE=""
-if [ "$1" = "-o" ] || [ "$1" = "--output" ]; then
-  OUTPUT_FILE="$2"
-  shift 2
-fi
-if [ -n "$OUTPUT_FILE" ]; then
-  exec > >(tee "$OUTPUT_FILE") 2>&1
-  echo "Вывод дублируется в файл: $OUTPUT_FILE"
-fi
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--output)
+      if [ -z "$2" ]; then
+        echo "Флагу -o/--output нужно имя файла: bash vps-check.sh -o report.txt 9"
+        exit 1
+      fi
+      OUTPUT_FILE="$2"
+      shift 2
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${ARGS[@]}"
 
 run() {
   echo -e "\n########## $1 ##########\n"
-  eval "$2"
+  bash -c "set -o pipefail; $2"
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "[!] Пункт \"$1\" завершился с ошибкой (код $rc) — сеть моргнула, источник недоступен, или что-то ещё пошло не так. Часть данных выше может отсутствовать."
+  fi
 }
+
+# ставит пакет через тот менеджер, что реально есть в системе
+# (apt/dnf/yum/apk/pacman); возвращает 1, если ни один не найден
+pkg_install() {
+  local pkg="$1"
+  if command -v apt >/dev/null; then
+    if ! apt update -qq 2>/dev/null; then
+      echo "[i] apt update не удался — похоже, нет сети до зеркал репозитория. Дальнейшая ошибка 'Unable to locate package' будет из-за этого, а не потому что пакета нет."
+    fi
+    apt install -y "$pkg"
+  elif command -v dnf >/dev/null; then
+    dnf makecache -q 2>/dev/null
+    dnf install -y "$pkg"
+  elif command -v yum >/dev/null; then
+    yum makecache -q 2>/dev/null
+    yum install -y "$pkg"
+  elif command -v apk >/dev/null; then
+    # apk add сам подтягивает свежие индексы, отдельный update не нужен
+    apk add --no-cache "$pkg"
+  elif command -v pacman >/dev/null; then
+    # без -Sy: частичное обновление (-Sy + один пакет без -u) — известный
+    # анти-паттерн на Arch, может подтянуть пакет новее, чем остальная
+    # система. Если локальные индексы совсем протухли — pacman сам
+    # откажется ставить и подскажет обновиться (-Syu) вручную.
+    pacman -S --noconfirm "$pkg"
+  else
+    echo "Не нашёл apt/dnf/yum/apk/pacman — поставь '$pkg' вручную для своего дистрибутива."
+    return 1
+  fi
+}
+export -f pkg_install
+
 
 menu() {
   cat <<'EOF'
@@ -40,10 +86,13 @@ menu() {
 10) Disk & FS       - свободное место, inode, ошибки файловой системы
 11) SSL Check       - срок действия сертификата домена (нужен аргумент-домен)
 12) Geekbench       - только Geekbench (без fio/iperf3), для сравнения CPU между хостерами
-0)  Все по очереди (пункты 1-10; 11 и 12 пропускаются — см. ниже)
+13) Censorcheck (geoblock) - не банит ли зарубежный сервис сам IP по гео (в отличие от 5 — DPI РФ)
+0)  Все по очереди (пункты 1-10, 13; 11 и 12 пропускаются — см. ниже)
 
 Диапазоны: bash vps-check.sh 2,4,5-7
 Вывод в файл: bash vps-check.sh -o report.txt 9
+На полном прогоне (0/all) вывод длинный и никуда не сохраняется без -o —
+если не хочешь потерять начало за скроллбеком терминала: bash vps-check.sh -o report.txt
 11 (SSL) нужен домен и не входит в общий прогон: bash vps-check.sh 11 example.com
 12 (Geekbench) не входит в общий прогон — CPU уже покрыт пунктом 1: bash vps-check.sh 12
 EOF
@@ -55,14 +104,29 @@ cmd_2() { run "RU Speedtest (itdoginfo)" "bash <(wget -qO- https://github.com/it
 cmd_3() { run "IP Quality" "bash <(curl -Ls ip.check.place) -l en"; }
 cmd_4() { run "Geolocation Check" "bash <(wget -qO- https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh)"; }
 cmd_5() { run "Censorcheck (DPI mode)" "bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi"; }
+cmd_13() { run "Censorcheck (geoblock mode)" "bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock --no-dns"; }
 cmd_6() { run "Bench.sh (Teddysun)" "wget -qO- bench.sh | bash"; }
-cmd_7() { run "sysbench CPU" "command -v sysbench >/dev/null || apt install -y sysbench; sysbench cpu run --threads=1"; }
+cmd_7() { run "sysbench CPU" "command -v sysbench >/dev/null || pkg_install sysbench; if command -v sysbench >/dev/null; then sysbench cpu run --threads=1; else echo '[i] sysbench не установлен, тест пропущен'; fi"; }
 
 cmd_8() {
   echo -e "\n########## Globalping (доступность этого сервера из РФ) ##########\n"
   if ! command -v globalping >/dev/null; then
-    curl -s https://packagecloud.io/install/repositories/jsdelivr/globalping/script.deb.sh | bash >/dev/null 2>&1
-    apt install -y globalping >/dev/null 2>&1
+    if command -v apt >/dev/null; then
+      curl -s https://packagecloud.io/install/repositories/jsdelivr/globalping/script.deb.sh | bash >/dev/null 2>&1
+      apt install -y globalping >/dev/null 2>&1
+    elif command -v dnf >/dev/null; then
+      curl -s https://packagecloud.io/install/repositories/jsdelivr/globalping/script.rpm.sh | bash >/dev/null 2>&1
+      dnf install -y globalping >/dev/null 2>&1
+    elif command -v brew >/dev/null; then
+      brew tap jsdelivr/globalping >/dev/null 2>&1
+      brew install globalping >/dev/null 2>&1
+    else
+      echo "Официальных пакетов globalping для этого дистрибутива нет (apt/dnf/brew поддерживаются, для Alpine/Arch — только вручную через AUR/community): https://github.com/jsdelivr/globalping-cli"
+    fi
+  fi
+  if ! command -v globalping >/dev/null; then
+    echo "globalping не установлен, пропускаю проверку."
+    return
   fi
   MY_IP=$(curl -s https://api.ipify.org || curl -s ifconfig.me)
   echo "Проверяемый IP этого сервера: ${MY_IP}"
@@ -79,6 +143,8 @@ cmd_8() {
 # отсутствующих утилит для самой проверки. В конце — оценка 0-100.
 cmd_9() {
   echo -e "\n########## Security Audit (только чтение) ##########\n"
+  [ "$(id -u)" -ne 0 ] && echo "[!] Запущено не от root — ss/dmesg/iptables/fail2ban-client могут отдать урезанный или пустой вывод. Для полной картины: sudo bash vps-check.sh 9"
+  echo
 
   SCORE=100
   deduct() {
@@ -92,12 +158,14 @@ cmd_9() {
   # sshd_config.d/ и в самом sshd_config переопределяют более ранние.
   # Склеиваем файлы в этом порядке и берём последнее совпадение.
   SSHD_FILES=()
+  shopt -s nullglob
   [ -d /etc/ssh/sshd_config.d ] && SSHD_FILES+=(/etc/ssh/sshd_config.d/*.conf)
+  shopt -u nullglob
   [ -r /etc/ssh/sshd_config ] && SSHD_FILES+=(/etc/ssh/sshd_config)
 
   if [ ${#SSHD_FILES[@]} -gt 0 ]; then
     get_ssh() {
-      val=$(cat "${SSHD_FILES[@]}" 2>/dev/null | grep -iE "^\s*$1\s+" | tail -1 | awk '{print $2}')
+      val=$(cat "${SSHD_FILES[@]}" 2>/dev/null | grep -iE "^[[:space:]]*$1[[:space:]]+" | tail -1 | awk '{print $2}')
       echo "${val:-не задано}"
     }
     ROOT_LOGIN=$(get_ssh PermitRootLogin)
@@ -223,6 +291,8 @@ cmd_9() {
 # ---------- 10. Disk & Filesystem ----------
 cmd_10() {
   echo -e "\n########## Disk & Filesystem ##########\n"
+  [ "$(id -u)" -ne 0 ] && echo "[!] Запущено не от root — dmesg может вернуть пусто из-за kernel.dmesg_restrict, это не значит, что ошибок нет. Для полной картины: sudo bash vps-check.sh 10"
+  echo
 
   echo "=== Свободное место (df) ==="
   df -hT 2>/dev/null || df -h
@@ -235,7 +305,7 @@ cmd_10() {
   echo "=== Ошибки файловой системы в dmesg (последние 20 строк) ==="
   if command -v dmesg >/dev/null; then
     dmesg 2>/dev/null | grep -iE "ext4|xfs|i/o error|read-only file system" | tail -20
-    if [ $? -ne 0 ]; then
+    if [ "${PIPESTATUS[1]}" -ne 0 ]; then
       echo "Ошибок не найдено (или dmesg недоступен без root)."
     fi
   else
@@ -270,12 +340,13 @@ cmd_11() {
     || echo "Не удалось получить сертификат (сайт недоступен по 443 или openssl не установлен)."
 }
 
-# ---------- разбор аргументов вида 2,4,5-7 (с проверкой границ 1-12) ----------
+# ---------- разбор аргументов вида 2,4,5-7 (с проверкой границ 1-13) ----------
 expand_selection() {
   input="$1"
   result=""
   IFS=',' read -ra parts <<< "$input"
   for part in "${parts[@]}"; do
+    part="${part// /}"
     if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
       start="${BASH_REMATCH[1]}"
       end="${BASH_REMATCH[2]}"
@@ -285,7 +356,14 @@ expand_selection() {
       fi
       [ "$start" -lt "$MIN_ITEM" ] && { echo "Диапазон $part выходит за $MIN_ITEM-$MAX_ITEM, обрезаю до $MIN_ITEM" >&2; start=$MIN_ITEM; }
       [ "$end" -gt "$MAX_ITEM" ] && { echo "Диапазон $part выходит за $MIN_ITEM-$MAX_ITEM, обрезаю до $MAX_ITEM" >&2; end=$MAX_ITEM; }
+      if [ "$start" -le 11 ] && [ "$end" -ge 11 ]; then
+        echo "Внимание: диапазон $part включает пункт 11 (SSL Check) — без домена вторым аргументом он просто попросит его и ничего не проверит" >&2
+      fi
+      if [ "$start" -le 12 ] && [ "$end" -ge 12 ]; then
+        echo "Внимание: диапазон $part включает пункт 12 (Geekbench) — это долгий тест (5-10 минут), добавлен намеренно?" >&2
+      fi
       for ((i=start; i<=end; i++)); do
+        case " $result " in *" $i "*) continue ;; esac
         result="$result $i"
       done
     elif [[ "$part" =~ ^[0-9]+$ ]]; then
@@ -293,6 +371,7 @@ expand_selection() {
         echo "Пункта $part не существует (доступны $MIN_ITEM-$MAX_ITEM), пропускаю" >&2
         continue
       fi
+      case " $result " in *" $part "*) continue ;; esac
       result="$result $part"
     fi
   done
@@ -300,25 +379,38 @@ expand_selection() {
 }
 
 ARG="$1"
-case "$ARG" in
-  ""|все|all|0)
-    for i in 1 2 3 4 5 6 7 8 9 10; do "cmd_$i"; done
-    echo -e "\n(пункт 11 — SSL Check — пропущен, нужен домен: bash vps-check.sh 11 example.com)"
-    echo "(пункт 12 — Geekbench отдельно — пропущен, CPU уже покрыт пунктом 1 (YABS); запусти bash vps-check.sh 12 вручную для отдельного сравнения)"
-    ;;
-  menu|-h|--help)
-    menu
-    ;;
-  11)
-    cmd_11 "$2"
-    ;;
-  *[0-9]*)
-    for n in $(expand_selection "$ARG"); do
-      "cmd_$n"
-    done
-    ;;
-  *)
-    echo "Неизвестный аргумент"
-    menu
-    ;;
-esac
+
+dispatch() {
+  case "$ARG" in
+    ""|все|all|0)
+      for i in 1 2 3 4 5 6 7 8 9 10 13; do "cmd_$i"; done
+      echo -e "\n(пункт 11 — SSL Check — пропущен, нужен домен: bash vps-check.sh 11 example.com)"
+      echo "(пункт 12 — Geekbench отдельно — пропущен, CPU уже покрыт пунктом 1 (YABS); запусти bash vps-check.sh 12 вручную для отдельного сравнения)"
+      ;;
+    menu|-h|--help)
+      menu
+      ;;
+    11)
+      cmd_11 "$2"
+      ;;
+    *[0-9]*)
+      for n in $(expand_selection "$ARG"); do
+        if [ "$n" = "11" ]; then
+          cmd_11 "$2"
+        else
+          "cmd_$n"
+        fi
+      done
+      ;;
+    *)
+      echo "Неизвестный аргумент"
+      menu
+      ;;
+  esac
+}
+
+if [ -n "$OUTPUT_FILE" ]; then
+  dispatch 2>&1 | tee "$OUTPUT_FILE"
+else
+  dispatch
+fi
