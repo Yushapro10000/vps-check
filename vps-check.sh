@@ -1,26 +1,38 @@
 #!/usr/bin/env bash
 # Полный чек-лист для проверки VPS перед/после покупки
 # Запуск:
-#   bash vps-check.sh                      -> пункты 1-10, 13, 14 по очереди (без 11 и 12)
+#   bash vps-check.sh                      -> интерактивный запуск (пункты 1-10, 13, 14)
+#   bash vps-check.sh -o report.txt        -> сохранить чистый TXT отчёт
+#   bash vps-check.sh -m report.md         -> сгенерировать форматированный Markdown
+#   bash vps-check.sh -o rep.txt -m rep.md -> сохранить оба отчёта сразу
 #   bash vps-check.sh 3                    -> только пункт 3
 #   bash vps-check.sh 2,4,5-7              -> пункты 2, 4, 5, 6, 7
-#   bash vps-check.sh -o report.txt 9      -> тот же запуск, плюс сохранить вывод в файл
 #   bash vps-check.sh menu                 -> список пунктов
 
 MIN_ITEM=1
 MAX_ITEM=14
 
-# ---------- разбор -o/--output (в любой позиции) ----------
-OUTPUT_FILE=""
+# ---------- разбор флагов вывода (-o / -m) в любой позиции ----------
+OUTPUT_TXT=""
+OUTPUT_MD=""
 ARGS=()
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--output)
-      if [ -z "$2" ]; then
-        echo "Флагу -o/--output нужно имя файла: bash vps-check.sh -o report.txt 9"
+      if [ -z "${2:-}" ]; then
+        echo "Флагу -o/--output нужно имя файла: bash vps-check.sh -o report.txt" >&2
         exit 1
       fi
-      OUTPUT_FILE="$2"
+      OUTPUT_TXT="$2"
+      shift 2
+      ;;
+    -m|--md|--markdown)
+      if [ -z "${2:-}" ]; then
+        echo "Флагу -m/--markdown нужно имя файла: bash vps-check.sh -m report.md" >&2
+        exit 1
+      fi
+      OUTPUT_MD="$2"
       shift 2
       ;;
     *)
@@ -31,6 +43,40 @@ while [ $# -gt 0 ]; do
 done
 set -- "${ARGS[@]}"
 
+ARG="${1:-}"
+TARGET_DOMAIN="${2:-}"
+
+# ---------- утилиты очистки и безопасной загрузки ----------
+strip_ansi() {
+  sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b([B0]//g' -e 's/\r//g'
+}
+
+fetch_run() {
+  local label="$1"
+  local url="$2"
+  shift 2
+  local content=""
+
+  content=$(curl -fsSL --connect-timeout 5 --max-time 30 "$url" 2>/dev/null) || \
+  content=$(wget -qO- --timeout=30 "$url" 2>/dev/null)
+
+  if [ -z "$content" ]; then
+    echo "[!] Не удалось скачать скрипт для \"$label\" ($url) — таймаут или зеркало недоступно."
+    return 1
+  fi
+
+  local tmp
+  tmp=$(mktemp /tmp/vps-run-XXXXXX.sh) || {
+    echo "[!] Не удалось создать временный файл в /tmp для \"$label\"" >&2
+    return 1
+  }
+  printf '%s\n' "$content" > "$tmp"
+  bash "$tmp" "$@"
+  local rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
 run() {
   echo -e "\n########## $1 ##########\n"
   bash -c "set -o pipefail; $2"
@@ -40,37 +86,35 @@ run() {
   fi
 }
 
-# ставит пакет через тот менеджер, что реально есть в системе
-# (apt/dnf/yum/apk/pacman); возвращает 1, если ни один не найден
 pkg_install() {
   local pkg="$1"
+  local sudo_cmd=""
+  [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && sudo_cmd="sudo"
+
   if command -v apt >/dev/null; then
-    if ! apt update -qq 2>/dev/null; then
-      echo "[i] apt update не удался — похоже, нет сети до зеркал репозитория. Дальнейшая ошибка 'Unable to locate package' будет из-за этого, а не потому что пакета нет."
+    if ! $sudo_cmd apt update -qq 2>/dev/null; then
+      echo "[i] apt update не удался — возможно, нет сети до зеркал репозитория."
     fi
-    apt install -y "$pkg"
+    $sudo_cmd apt install -y "$pkg"
   elif command -v dnf >/dev/null; then
-    dnf makecache -q 2>/dev/null
-    dnf install -y "$pkg"
+    $sudo_cmd dnf makecache -q 2>/dev/null
+    $sudo_cmd dnf install -y "$pkg"
   elif command -v yum >/dev/null; then
-    yum makecache -q 2>/dev/null
-    yum install -y "$pkg"
+    $sudo_cmd yum makecache -q 2>/dev/null
+    $sudo_cmd yum install -y "$pkg"
   elif command -v apk >/dev/null; then
-    # apk add сам подтягивает свежие индексы, отдельный update не нужен
-    apk add --no-cache "$pkg"
+    $sudo_cmd apk add --no-cache "$pkg"
   elif command -v pacman >/dev/null; then
-    # без -Sy: частичное обновление (-Sy + один пакет без -u) — известный
-    # анти-паттерн на Arch, может подтянуть пакет новее, чем остальная
-    # система. Если локальные индексы совсем протухли — pacman сам
-    # откажется ставить и подскажет обновиться (-Syu) вручную.
-    pacman -S --noconfirm "$pkg"
+    $sudo_cmd pacman -S --noconfirm "$pkg"
   else
     echo "Не нашёл apt/dnf/yum/apk/pacman — поставь '$pkg' вручную для своего дистрибутива."
     return 1
   fi
 }
-export -f pkg_install
 
+export -f fetch_run
+export -f strip_ansi
+export -f pkg_install
 
 menu() {
   cat <<'EOF'
@@ -91,45 +135,63 @@ menu() {
 0)  Все по очереди (пункты 1-10, 13, 14; 11 и 12 пропускаются — см. ниже)
 
 Диапазоны: bash vps-check.sh 2,4,5-7
-Вывод в файл: bash vps-check.sh -o report.txt 9
-Перед запуском скрипт спросит, кэшировать ли вывод и показать ли его ещё раз в конце —
-полезно на полном прогоне (0/all), где вывод длинный и легко уехать за скроллбек терминала.
+Вывод в файл:
+  bash vps-check.sh -o report.txt 9          -> чистый текстовый файл
+  bash vps-check.sh -m report.md 9           -> форматированный Markdown
+  bash vps-check.sh -o rep.txt -m rep.md 0   -> оба формата сразу
 11 (SSL) нужен домен и не входит в общий прогон: bash vps-check.sh 11 example.com
-12 (Geekbench) не входит в общий прогон — CPU уже покрыт пунктом 1: bash vps-check.sh 12
+12 (Geekbench) не входит в общий прогон: bash vps-check.sh 12
 EOF
 }
 
-cmd_1() { run "YABS" "curl -sL yabs.sh | bash"; }
-cmd_12() { run "Geekbench (только CPU, без fio/iperf3)" "curl -sL yabs.sh | bash -s -- -f -i"; }
-cmd_2() { run "RU Speedtest (itdoginfo)" "bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)"; }
-cmd_3() { run "IP Quality" "bash <(curl -Ls ip.check.place) -l en"; }
-cmd_4() { run "Geolocation Check" "bash <(wget -qO- https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh)"; }
-cmd_5() { run "Censorcheck (DPI mode)" "bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi"; }
-cmd_13() { run "Censorcheck (geoblock mode)" "bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock --no-dns"; }
-cmd_6() { run "Bench.sh (Teddysun)" "wget -qO- bench.sh | bash"; }
+cmd_1() { run "YABS" "curl -fsSL --connect-timeout 5 --max-time 30 https://yabs.sh | bash"; }
+cmd_12() { run "Geekbench (только CPU)" "curl -fsSL --connect-timeout 5 --max-time 30 https://yabs.sh | bash -s -- -f -i"; }
+cmd_2() { run "RU Speedtest (itdoginfo)" "fetch_run 'RU Speedtest' 'https://raw.githubusercontent.com/itdoginfo/russian-iperf3-servers/main/speedtest.sh'"; }
+cmd_3() { run "IP Quality" "curl -fsSL --connect-timeout 5 --max-time 30 https://ip.check.place | bash -s -- -l en"; }
+cmd_4() { run "Geolocation Check" "fetch_run 'Geolocation' 'https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh'"; }
+cmd_5() { run "Censorcheck (DPI mode)" "fetch_run 'Censorcheck' 'https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh' --mode dpi"; }
+cmd_13() { run "Censorcheck (geoblock mode)" "fetch_run 'Censorcheck geoblock' 'https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh' --mode geoblock --no-dns"; }
+cmd_6() { run "Bench.sh (Teddysun)" "fetch_run 'Bench.sh' 'https://bench.sh'"; }
 cmd_7() { run "sysbench CPU" "command -v sysbench >/dev/null || pkg_install sysbench; if command -v sysbench >/dev/null; then sysbench cpu run --threads=1; else echo '[i] sysbench не установлен, тест пропущен'; fi"; }
 
 cmd_8() {
   echo -e "\n########## Globalping (доступность этого сервера из РФ) ##########\n"
+  local sudo_cmd=""
+  [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && sudo_cmd="sudo"
+
   if ! command -v globalping >/dev/null; then
+    if [ "$(id -u)" -ne 0 ] && [ -z "$sudo_cmd" ]; then
+      echo "[i] Запущено не от root и утилита sudo не найдена — автоматическая установка globalping невозможна. Пропускаю пункт."
+      return
+    fi
+
     if command -v apt >/dev/null; then
-      curl -s https://packagecloud.io/install/repositories/jsdelivr/globalping/script.deb.sh | bash >/dev/null 2>&1
-      apt install -y globalping >/dev/null 2>&1
+      curl -fsSL https://packagecloud.io/install/repositories/jsdelivr/globalping/script.deb.sh | $sudo_cmd bash >/dev/null 2>&1
+      $sudo_cmd apt install -y globalping >/dev/null 2>&1
     elif command -v dnf >/dev/null; then
-      curl -s https://packagecloud.io/install/repositories/jsdelivr/globalping/script.rpm.sh | bash >/dev/null 2>&1
-      dnf install -y globalping >/dev/null 2>&1
+      curl -fsSL https://packagecloud.io/install/repositories/jsdelivr/globalping/script.rpm.sh | $sudo_cmd bash >/dev/null 2>&1
+      $sudo_cmd dnf install -y globalping >/dev/null 2>&1
     elif command -v brew >/dev/null; then
       brew tap jsdelivr/globalping >/dev/null 2>&1
       brew install globalping >/dev/null 2>&1
     else
-      echo "Официальных пакетов globalping для этого дистрибутива нет (apt/dnf/brew поддерживаются, для Alpine/Arch — только вручную через AUR/community): https://github.com/jsdelivr/globalping-cli"
+      echo "Официальных пакетов globalping для этого дистрибутива нет (apt/dnf/brew поддерживаются): https://github.com/jsdelivr/globalping-cli"
     fi
   fi
   if ! command -v globalping >/dev/null; then
     echo "globalping не установлен, пропускаю проверку."
     return
   fi
-  MY_IP=$(curl -s https://api.ipify.org || curl -s ifconfig.me)
+
+  MY_IP=$(curl -fsSL --connect-timeout 4 --max-time 6 https://api.ipify.org 2>/dev/null \
+       || curl -fsSL --connect-timeout 4 --max-time 6 https://ifconfig.me 2>/dev/null \
+       || curl -fsSL --connect-timeout 4 --max-time 6 https://icanhazip.com 2>/dev/null)
+
+  if [ -z "$MY_IP" ]; then
+    echo "[!] Не удалось определить внешний IP этого сервера (проблема с сетью/DNS)."
+    return 1
+  fi
+
   echo "Проверяемый IP этого сервера: ${MY_IP}"
   echo
   echo "--- ping с 5 нод в РФ ---"
@@ -140,8 +202,6 @@ cmd_8() {
 }
 
 # ---------- 9. Security Audit ----------
-# Только чтение: ничего не меняет и не устанавливает, кроме
-# отсутствующих утилит для самой проверки. В конце — оценка 0-100.
 cmd_9() {
   echo -e "\n########## Security Audit (только чтение) ##########\n"
   [ "$(id -u)" -ne 0 ] && echo "[!] Запущено не от root — ss/dmesg/iptables/fail2ban-client могут отдать урезанный или пустой вывод. Для полной картины: sudo bash vps-check.sh 9"
@@ -154,42 +214,40 @@ cmd_9() {
   }
 
   echo "=== SSH-конфигурация ==="
-  # Debian/Ubuntu подключают /etc/ssh/sshd_config.d/*.conf директивой Include
-  # обычно в начале основного файла — то есть более поздние совпадения в
-  # sshd_config.d/ и в самом sshd_config переопределяют более ранние.
-  # Склеиваем файлы в этом порядке и берём последнее совпадение.
   SSHD_FILES=()
   shopt -s nullglob
   [ -d /etc/ssh/sshd_config.d ] && SSHD_FILES+=(/etc/ssh/sshd_config.d/*.conf)
   shopt -u nullglob
   [ -r /etc/ssh/sshd_config ] && SSHD_FILES+=(/etc/ssh/sshd_config)
 
-  if [ ${#SSHD_FILES[@]} -gt 0 ]; then
-    get_ssh() {
-      val=$(cat "${SSHD_FILES[@]}" 2>/dev/null | grep -iE "^[[:space:]]*$1[[:space:]]+" | tail -1 | awk '{print $2}')
-      echo "${val:-не задано}"
-    }
-    ROOT_LOGIN=$(get_ssh PermitRootLogin)
-    PASS_AUTH=$(get_ssh PasswordAuthentication)
-    SSH_PORT=$(get_ssh Port)
-    PUBKEY_AUTH=$(get_ssh PubkeyAuthentication)
+  get_ssh() {
+    local key="$1"
+    local val=""
+    if command -v sshd >/dev/null && sshd_test=$(sshd -T 2>/dev/null); then
+      val=$(echo "$sshd_test" | grep -i "^${key}[[:space:]]" | head -1 | awk '{print $2}')
+    fi
+    if [ -z "$val" ] && [ ${#SSHD_FILES[@]} -gt 0 ]; then
+      val=$(cat "${SSHD_FILES[@]}" 2>/dev/null | grep -iE "^[[:space:]]*${key}[[:space:]]+" | head -1 | awk '{print $2}')
+    fi
+    echo "${val:-не задано}"
+  }
 
-    echo "PermitRootLogin:        $ROOT_LOGIN"
-    echo "PasswordAuthentication: $PASS_AUTH"
-    echo "Port:                   ${SSH_PORT:-22 (по умолчанию)}"
-    echo "PubkeyAuthentication:   $PUBKEY_AUTH"
-    echo "(учтены основной sshd_config и /etc/ssh/sshd_config.d/*.conf)"
+  ROOT_LOGIN=$(get_ssh PermitRootLogin)
+  PASS_AUTH=$(get_ssh PasswordAuthentication)
+  SSH_PORT=$(get_ssh Port)
+  PUBKEY_AUTH=$(get_ssh PubkeyAuthentication)
 
-    case "$ROOT_LOGIN" in
-      yes) deduct 20 "root может логиниться по SSH напрямую (PermitRootLogin yes)" ;;
-    esac
-    case "$PASS_AUTH" in
-      yes|"не задано") deduct 20 "разрешён вход по паролю (PasswordAuthentication yes/не задано — по умолчанию у большинства систем это yes)" ;;
-    esac
-  else
-    echo "Нет доступа к sshd_config и sshd_config.d/ — SSH-часть аудита пропущена."
-    deduct 10 "не удалось прочитать конфиг SSH (запусти от root для полной проверки)"
-  fi
+  echo "PermitRootLogin:        $ROOT_LOGIN"
+  echo "PasswordAuthentication: $PASS_AUTH"
+  echo "Port:                   ${SSH_PORT:-22 (по умолчанию)}"
+  echo "PubkeyAuthentication:   $PUBKEY_AUTH"
+
+  case "$ROOT_LOGIN" in
+    yes) deduct 20 "root может логиниться по SSH напрямую (PermitRootLogin yes)" ;;
+  esac
+  case "$PASS_AUTH" in
+    yes|"не задано") deduct 20 "разрешён вход по паролю (PasswordAuthentication yes/не задано — по умолчанию yes)" ;;
+  esac
 
   echo
   echo "=== Firewall ==="
@@ -216,7 +274,6 @@ cmd_9() {
     echo "--- iptables (сырые правила) ---"
     RULES=$(iptables -L -n 2>/dev/null)
     echo "$RULES"
-    # если есть хоть одно ACCEPT/DROP/REJECT правило кроме политики по умолчанию — считаем, что что-то настроено
     if echo "$RULES" | grep -qE "^(ACCEPT|DROP|REJECT)"; then
       FW_ACTIVE=1
     fi
@@ -234,7 +291,7 @@ cmd_9() {
     fail2ban-client status 2>/dev/null || echo "(команда fail2ban-client недоступна для чтения статуса)"
     F2B_ACTIVE=1
   elif command -v fail2ban-client >/dev/null; then
-    echo "fail2ban установлен, но НЕ запущен (systemctl is-active вернул false)."
+    echo "fail2ban установлен, но НЕ запущен."
   elif command -v cscli >/dev/null && systemctl is-active --quiet crowdsec 2>/dev/null; then
     echo "CrowdSec установлен и запущен."
     cscli metrics 2>/dev/null | head -20
@@ -253,15 +310,20 @@ cmd_9() {
   UPD_OK=0
   if dpkg -s unattended-upgrades >/dev/null 2>&1; then
     echo "unattended-upgrades установлен."
-    if systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
-      echo "и включён (systemctl is-enabled)."
+    if systemctl is-enabled --quiet unattended-upgrades 2>/dev/null || systemctl is-active --quiet apt-daily-upgrade.timer 2>/dev/null; then
+      echo "и включён (через systemd сервис или apt-daily-upgrade.timer)."
       UPD_OK=1
     else
       echo "но не включён в systemd."
     fi
   elif command -v dnf >/dev/null && rpm -q dnf-automatic >/dev/null 2>&1; then
     echo "dnf-automatic установлен."
-    UPD_OK=1
+    if systemctl is-enabled --quiet dnf-automatic.timer 2>/dev/null || systemctl is-active --quiet dnf-automatic.timer 2>/dev/null; then
+      echo "и активен dnf-automatic.timer."
+      UPD_OK=1
+    else
+      echo "таймер dnf-automatic.timer не включён."
+    fi
   else
     echo "Автообновления безопасности не настроены."
   fi
@@ -292,7 +354,7 @@ cmd_9() {
 # ---------- 10. Disk & Filesystem ----------
 cmd_10() {
   echo -e "\n########## Disk & Filesystem ##########\n"
-  [ "$(id -u)" -ne 0 ] && echo "[!] Запущено не от root — dmesg может вернуть пусто из-за kernel.dmesg_restrict, это не значит, что ошибок нет. Для полной картины: sudo bash vps-check.sh 10"
+  [ "$(id -u)" -ne 0 ] && echo "[!] Запущено не от root — dmesg может вернуть пусто из-за kernel.dmesg_restrict. Для полной картины: sudo bash vps-check.sh 10"
   echo
 
   echo "=== Свободное место (df) ==="
@@ -305,9 +367,11 @@ cmd_10() {
   echo
   echo "=== Ошибки файловой системы в dmesg (последние 20 строк) ==="
   if command -v dmesg >/dev/null; then
-    dmesg 2>/dev/null | grep -iE "ext4|xfs|i/o error|read-only file system" | tail -20
-    if [ "${PIPESTATUS[1]}" -ne 0 ]; then
-      echo "Ошибок не найдено (или dmesg недоступен без root)."
+    FS_ERRORS=$(dmesg 2>/dev/null | grep -iE "EXT4-fs error|XFS.*error|I/O error|read-only file system|corrupt|buffer I/O error" | tail -20)
+    if [ -n "$FS_ERRORS" ]; then
+      echo "$FS_ERRORS"
+    else
+      echo "Ошибок не найдено (или dmesg пуст/недоступен без root)."
     fi
   else
     echo "dmesg недоступен."
@@ -319,7 +383,7 @@ cmd_10() {
     for dev in /dev/sd? /dev/vd? /dev/nvme?n1; do
       [ -e "$dev" ] || continue
       echo "--- $dev ---"
-      smartctl -H "$dev" 2>/dev/null || echo "недоступно (частая история для VPS — диск виртуальный)"
+      smartctl -H "$dev" 2>/dev/null || echo "недоступно (для VPS это норма — диск виртуальный)"
     done
   else
     echo "smartctl не установлен (apt install -y smartmontools) — для VPS часто бесполезно, диск виртуальный."
@@ -327,14 +391,18 @@ cmd_10() {
 }
 
 # ---------- 11. SSL Check ----------
-# Использование: bash vps-check.sh 11 example.com
 cmd_11() {
-  domain="$1"
+  local domain="${1:-$TARGET_DOMAIN}"
   echo -e "\n########## SSL Check ##########\n"
   if [ -z "$domain" ]; then
     echo "Нужен домен: bash vps-check.sh 11 example.com"
-    return
+    return 1
   fi
+
+  domain="${domain#*://}"
+  domain="${domain%%/*}"
+  domain="${domain%%:*}"
+
   echo "Проверяю сертификат для: $domain"
   echo | openssl s_client -servername "$domain" -connect "$domain:443" 2>/dev/null \
     | openssl x509 -noout -subject -issuer -dates \
@@ -349,26 +417,24 @@ cmd_14() {
     echo "nmap не установлен, пропускаю проверку."
     return
   fi
-  # Флаги:
-  #  -Pn             — не полагаемся на ICMP-пинг для discovery: его тоже могут
-  #                    резать, а нас интересует именно TCP-connect до портов.
-  #  -n              — не делаем reverse DNS для IP. Нам нужны только сами IP,
-  #                    а если у VPS сломан DNS — лишний резолв только запутает вывод.
-  #  --host-timeout  — потолок на цель, чтобы фильтруемые порты (обычно 25)
-  #                    не растягивали пункт на минуты.
-  # IP захардкожены намеренно: если у VPS не работает DNS, проверка по имени
-  # упадёт раньше, чем мы дойдём до собственно сетевой доступности, и результат
-  # будет вводить в заблуждение (не понять — порт режет хостер или имя не
-  # резолвится). 45.33.32.156 = scanme.nmap.org (Linode), 142.250.27.27 —
-  # Google SMTP-инфраструктура, 1.1.1.1 / 8.8.8.8 — публичные DNS.
-  # Если Google-IP когда-нибудь устареет — проверь актуальный через
-  # 'getent hosts gmail-smtp-in.l.google.com' и поправь цель ниже.
+
   echo "=== Общая проверка (45.33.32.156 = scanme.nmap.org, официальная тестовая цель Nmap) ==="
   nmap -Pn -n --host-timeout 20s -p 22,80,443,9929,31337 45.33.32.156
 
   echo
-  echo "=== Исходящий SMTP (часто режут хостеры, чтобы не рассылали спам) ==="
-  nmap -Pn -n --host-timeout 20s -p 25,465,587 142.250.27.27
+  echo "=== Исходящий SMTP (часто режут хостеры для борьбы со спамом) ==="
+  echo "--- Порт 25 (MX-сервер Google: 142.250.27.27) ---"
+  nmap -Pn -n --host-timeout 20s -p 25 142.250.27.27
+
+  echo "--- Порты 465, 587 (клиентский релей Google smtp.gmail.com) ---"
+  RELAY_IP=$(getent ahostsv4 smtp.gmail.com 2>/dev/null | awk '{print $1; exit}')
+  if [ -n "$RELAY_IP" ]; then
+    echo "IP релея: $RELAY_IP (получен через DNS)"
+  else
+    RELAY_IP="64.233.184.108"
+    echo "DNS недоступен, используется резервный IP: $RELAY_IP"
+  fi
+  nmap -Pn -n --host-timeout 20s -p 465,587 "$RELAY_IP"
 
   echo
   echo "=== DNS/DoT наружу (Cloudflare 1.1.1.1, Google 8.8.8.8) ==="
@@ -378,26 +444,105 @@ cmd_14() {
   echo
   echo "Как читать результат:"
   echo "  open     — порт доступен, хостер не режет"
-  echo "  filtered — пакет ушёл, но ответа нет: хостер (или сеть по пути) дропает"
-  echo "  closed   — пакет дошёл до хоста, тот ответил RST: порт закрыт у самого"
-  echo "             сервиса, это НЕ блокировка хостера"
+  echo "  filtered — пакет ушёл, но ответа нет: хостер (или фаервол по пути) дропает пакеты"
+  echo "  closed   — пакет дошёл до хоста, тот ответил RST: служба не слушает, но блокировки нет"
   echo
-  echo "Filtered на 25/465/587 обычно значит, что хостер режет исходящий SMTP —"
-  echo "частая история у бюджетных VPS (борьба со спамом). Filtered на DNS/DoT —"
-  echo "редкость, но тоже встречается. Closed на 443 у scanme — это норма,"
-  echo "у scanme открыты не все тестовые порты, к хостеру отношения не имеет."
+  echo "Filtered на 25/465/587 обычно значит, что хостер режет исходящую почту."
 }
 
-# ---------- разбор аргументов вида 2,4,5-7 (с проверкой границ 1-14) ----------
+# ---------- генератор Markdown-отчёта ----------
+generate_markdown_report() {
+  local raw_file="$1"
+  local md_file="$2"
+
+  local clean_file
+  clean_file=$(mktemp /tmp/vps-clean-XXXXXX.log) || {
+    echo "[!] Не удалось создать временный файл для очистки отчёта" >&2
+    return 1
+  }
+  strip_ansi < "$raw_file" > "$clean_file"
+
+  local os_info="Не определено"
+  [ -f /etc/os-release ] && os_info=$(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')
+
+  local cpu_info
+  cpu_info=$(lscpu 2>/dev/null | awk -F: '/Model name/ {print $2}' | xargs)
+  [ -z "$cpu_info" ] && cpu_info=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
+  [ -z "$cpu_info" ] && cpu_info="Не определено"
+
+  local cpu_cores
+  cpu_cores=$(nproc 2>/dev/null || echo "1")
+
+  local ram_info
+  ram_info=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}')
+  [ -z "$ram_info" ] && ram_info="Не определено"
+
+  local kernel_info
+  kernel_info=$(uname -r)
+
+  local report_date
+  report_date=$(date "+%Y-%m-%d %H:%M:%S")
+
+  local sec_score
+  sec_score=$(grep -E "Оценка: [0-9]+/100" "$clean_file" | tail -1 | sed -E 's/.*Оценка: ([0-9]+\/100.*)/\1/')
+
+  cat <<EOF > "$md_file"
+# Отчёт проверки VPS
+
+| Параметр | Значение |
+| :--- | :--- |
+| **Дата проверки** | $report_date |
+| **ОС** | $os_info |
+| **Ядро Linux** | $kernel_info |
+| **Процессор** | $cpu_info ($cpu_cores vCPU) |
+| **Оперативная память** | $ram_info |
+EOF
+
+  if [ -n "$sec_score" ]; then
+    echo "| **Аудит безопасности** | $sec_score |" >> "$md_file"
+  fi
+
+  echo -e "\n---\n" >> "$md_file"
+  echo "## Результаты проверок" >> "$md_file"
+
+  awk '
+    BEGIN { in_block = 0 }
+    /^#{10} .+ #{10}$/ {
+      if (in_block) {
+        print "```\n"
+      }
+      sub(/^########## /, "")
+      sub(/ ##########$/, "")
+      print "\n### " $0 "\n"
+      print "```text"
+      in_block = 1
+      next
+    }
+    {
+      if (in_block) {
+        print $0
+      }
+    }
+    END {
+      if (in_block) {
+        print "```"
+      }
+    }
+  ' "$clean_file" >> "$md_file"
+
+  rm -f "$clean_file"
+}
+
+# ---------- разбор аргументов 2,4,5-7 ----------
 expand_selection() {
-  input="$1"
-  result=""
+  local input="$1"
+  local result=""
   IFS=',' read -ra parts <<< "$input"
   for part in "${parts[@]}"; do
     part="${part// /}"
     if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-      start="${BASH_REMATCH[1]}"
-      end="${BASH_REMATCH[2]}"
+      local start="${BASH_REMATCH[1]}"
+      local end="${BASH_REMATCH[2]}"
       if [ "$start" -gt "$end" ]; then
         echo "Пропускаю некорректный диапазон $part (начало больше конца)" >&2
         continue
@@ -405,10 +550,10 @@ expand_selection() {
       [ "$start" -lt "$MIN_ITEM" ] && { echo "Диапазон $part выходит за $MIN_ITEM-$MAX_ITEM, обрезаю до $MIN_ITEM" >&2; start=$MIN_ITEM; }
       [ "$end" -gt "$MAX_ITEM" ] && { echo "Диапазон $part выходит за $MIN_ITEM-$MAX_ITEM, обрезаю до $MAX_ITEM" >&2; end=$MAX_ITEM; }
       if [ "$start" -le 11 ] && [ "$end" -ge 11 ]; then
-        echo "Внимание: диапазон $part включает пункт 11 (SSL Check) — без домена вторым аргументом он просто попросит его и ничего не проверит" >&2
+        echo "Внимание: диапазон $part включает пункт 11 (SSL Check) — нужен домен вторым аргументом" >&2
       fi
       if [ "$start" -le 12 ] && [ "$end" -ge 12 ]; then
-        echo "Внимание: диапазон $part включает пункт 12 (Geekbench) — это долгий тест (5-10 минут), добавлен намеренно?" >&2
+        echo "Внимание: диапазон $part включает пункт 12 (Geekbench) — это долгий тест (5-10 минут)" >&2
       fi
       for ((i=start; i<=end; i++)); do
         case " $result " in *" $i "*) continue ;; esac
@@ -426,63 +571,107 @@ expand_selection() {
   echo "$result"
 }
 
-ARG="$1"
-
+# ---------- диспетчер запусков ----------
 dispatch() {
-  case "$ARG" in
+  local mode="${1:-$ARG}"
+  local extra="${2:-$TARGET_DOMAIN}"
+  case "$mode" in
     ""|все|all|0)
       for i in 1 2 3 4 5 6 7 8 9 10 13 14; do "cmd_$i"; done
       echo -e "\n(пункт 11 — SSL Check — пропущен, нужен домен: bash vps-check.sh 11 example.com)"
-      echo "(пункт 12 — Geekbench отдельно — пропущен, CPU уже покрыт пунктом 1 (YABS); запусти bash vps-check.sh 12 вручную для отдельного сравнения)"
-      ;;
-    menu|-h|--help)
-      menu
+      echo "(пункт 12 — Geekbench отдельно — пропущен, CPU уже покрыт пунктом 1 (YABS))"
       ;;
     11)
-      cmd_11 "$2"
+      cmd_11 "$extra"
       ;;
     *[0-9]*)
-      for n in $(expand_selection "$ARG"); do
+      for n in $(expand_selection "$mode"); do
         if [ "$n" = "11" ]; then
-          cmd_11 "$2"
+          cmd_11 "$extra"
         else
           "cmd_$n"
         fi
       done
       ;;
-    *)
-      echo "Неизвестный аргумент"
-      menu
-      ;;
   esac
 }
 
-# ---------- вопрос про кэширование задаём ДО запуска, один раз ----------
-CACHE_AND_SHOW=false
+# ---------- валидация аргументов и ранний выход ----------
 case "$ARG" in
-  menu|-h|--help) : ;;  # для справки кэшировать нечего
-  *)
-    if [ -t 0 ]; then
-      read -rp "Кэшировать вывод и показать его ещё раз одним куском в конце? [y/N]: " CACHE_ANS
-      [[ "$CACHE_ANS" =~ ^[Yy] ]] && CACHE_AND_SHOW=true
-      echo
+  menu|-h|--help)
+    menu
+    exit 0
+    ;;
+  ""|все|all|0|11)
+    : ;;
+  *[0-9]*)
+    if [[ ! "$ARG" =~ ^[0-9,-]+$ ]] || [ -z "$(expand_selection "$ARG" 2>/dev/null)" ]; then
+      echo "Неизвестный или некорректный аргумент: $ARG" >&2
+      menu
+      exit 1
     fi
+    ;;
+  *)
+    echo "Неизвестный аргумент: $ARG" >&2
+    menu
+    exit 1
     ;;
 esac
 
+# ---------- интерактивные вопросы (только если запуск в реальном TTY) ----------
+CACHE_AND_SHOW=false
+if [ -t 0 ]; then
+  read -rp "Кэшировать вывод и показать его ещё раз одним куском в конце? [y/N]: " CACHE_ANS
+  [[ "$CACHE_ANS" =~ ^[Yy] ]] && CACHE_AND_SHOW=true
+
+  # Если пути к файлам отчетов не были переданы через флаги CLI — спрашиваем интерактивно
+  if [ -z "$OUTPUT_TXT" ] && [ -z "$OUTPUT_MD" ]; then
+    read -rp "Сохранить отчёт в файл? [1: Нет (Enter), 2: TXT, 3: Markdown, 4: Оба]: " REP_ANS
+    DATE_TAG=$(date +%Y%m%d-%H%M)
+    case "$REP_ANS" in
+      2) OUTPUT_TXT="vps-report-${DATE_TAG}.txt" ;;
+      3) OUTPUT_MD="vps-report-${DATE_TAG}.md" ;;
+      4)
+        OUTPUT_TXT="vps-report-${DATE_TAG}.txt"
+        OUTPUT_MD="vps-report-${DATE_TAG}.md"
+        ;;
+    esac
+  fi
+  echo
+fi
+
+# ---------- выполнение и запись в сырой лог ----------
+TEMP_RAW=$(mktemp /tmp/vps-raw-XXXXXX.log) || {
+  echo "Не удалось создать временный файл в /tmp (диск переполнен или смонтирован в read-only)" >&2
+  exit 1
+}
+trap 'rm -f "$TEMP_RAW"' EXIT
+
+dispatch "$@" 2>&1 | tee "$TEMP_RAW"
+
+# 1. Повторный вывод лога (если запрошен кэш)
 if [ "$CACHE_AND_SHOW" = true ]; then
-  TEMP_LOG=$(mktemp /tmp/vps-check-XXXXXX.log)
-  TEE_TARGETS=("$TEMP_LOG")
-  [ -n "$OUTPUT_FILE" ] && TEE_TARGETS+=("$OUTPUT_FILE")
-  dispatch 2>&1 | tee "${TEE_TARGETS[@]}"
   echo
   echo "=========================================================="
-  echo "ПОЛНЫЙ ЛОГ ЭТОГО ЗАПУСКА (как просили в начале)"
+  echo "ПОЛНЫЙ ЛОГ ЭТОГО ЗАПУСКА"
   echo "=========================================================="
-  cat "$TEMP_LOG"
-  rm -f "$TEMP_LOG"
-elif [ -n "$OUTPUT_FILE" ]; then
-  dispatch 2>&1 | tee "$OUTPUT_FILE"
-else
-  dispatch
+  cat "$TEMP_RAW"
+fi
+
+# 2. Сохранение чистого TXT-отчёта без управляющих ANSI-последовательностей
+if [ -n "$OUTPUT_TXT" ]; then
+  if strip_ansi < "$TEMP_RAW" > "$OUTPUT_TXT"; then
+    echo -e "\n[✓] Текстовый отчёт сохранён в: $OUTPUT_TXT"
+  else
+    echo -e "\n[!] Не удалось сохранить TXT-отчёт в: $OUTPUT_TXT (проверь путь и права доступа)" >&2
+  fi
+fi
+
+# 3. Сохранение структурированного Markdown-отчёта
+if [ -n "$OUTPUT_MD" ]; then
+  if generate_markdown_report "$TEMP_RAW" "$OUTPUT_MD"; then
+    echo -e "[✓] Markdown-отчёт сохранён в: $OUTPUT_MD"
+  else
+    echo -e "[!] Не удалось создать Markdown-отчёт в: $OUTPUT_MD" >&2
+  fi
 fi
