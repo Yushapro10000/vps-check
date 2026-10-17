@@ -186,7 +186,7 @@ menu() {
 16) Speedtest СКФО  - Speedtest-CLI до серверов Северного Кавказа (storage.umager.ru)
 17) Instagram       - региональные ограничения Instagram по IP (storage.umager.ru)
 18) YouTube кластер - определение кластера YouTube (storage.umager.ru)
-19) Ookla Speedtest - скорость и пинг до ближайшего сервера Speedtest.net (официальный CLI)
+19) Ookla Speedtest - скорость и пинг до ближайшего сервера Speedtest.net (бывший пункт 15)
 0)  Все по очереди (пункты 1-10, 13-15, 17, 18; 11, 12, 16 и 19 пропускаются — см. ниже)
 
 Запуск без аргументов, all и все — то же, что 0. В списке 0 тоже означает общий прогон: 0,11 example.com
@@ -199,6 +199,7 @@ menu() {
 Пункт 9 может предложить установить fail2ban, если его нет (только с твоего согласия; -y вопрос отключает)
 11 (SSL) нужен домен и не входит в общий прогон: bash vps-check.sh 11 example.com
 12 (Geekbench) не входит в общий прогон: bash vps-check.sh 12
+16 (Speedtest СКФО) не входит в общий прогон: bash vps-check.sh 16
 19 (Ookla): конкретный сервер — OOKLA_SERVER_ID=<id> bash vps-check.sh 19 (список: speedtest -L)
 EOF
 }
