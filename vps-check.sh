@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Полный чек-лист для проверки VPS перед/после покупки
 # Запуск:
-#   bash vps-check.sh                      -> интерактивный запуск (пункты 1-10, 13-15)
+#   bash vps-check.sh                      -> интерактивный запуск (пункты 1-10, 13-15, 17, 18)
 #   bash vps-check.sh -o report.txt        -> сохранить чистый TXT отчёт
 #   bash vps-check.sh -m report.md         -> сгенерировать форматированный Markdown
 #   bash vps-check.sh -o rep.txt -m rep.md -> сохранить оба отчёта сразу
@@ -11,10 +11,10 @@
 #   bash vps-check.sh menu                 -> список пунктов
 
 MIN_ITEM=1
-MAX_ITEM=15
+MAX_ITEM=19
 
-# Пункты общего прогона (аргумент 0 / all / без аргументов). 11 и 12 — только вручную.
-DEFAULT_ITEMS="1 2 3 4 5 6 7 8 9 10 13 14 15"
+# Пункты общего прогона (аргумент 0 / all / без аргументов). 11, 12, 16 и 19 — только вручную.
+DEFAULT_ITEMS="1 2 3 4 5 6 7 8 9 10 13 14 15 17 18"
 
 # Глобальные переменные для очистки временных файлов при выходе (в том числе по Ctrl+C)
 TEMP_RAW=""
@@ -22,9 +22,9 @@ CLEAN_FILE=""
 OOKLA_TMPDIR=""
 NO_PROMPT=0
 
-# Версия официального Speedtest CLI от Ookla (пункт 15). Если ссылка на скачивание
+# Версия официального Speedtest CLI от Ookla (пункт 19). Если ссылка на скачивание
 # перестала работать — проверь актуальную версию на https://www.speedtest.net/apps/cli
-# Переопределить без правки файла: OOKLA_VERSION=1.2.0 bash vps-check.sh 15
+# Переопределить без правки файла: OOKLA_VERSION=1.2.0 bash vps-check.sh 19
 OOKLA_VERSION="${OOKLA_VERSION:-1.2.0}"
 
 # ---------- разбор флагов вывода (-o / -m) в любой позиции ----------
@@ -88,22 +88,30 @@ fetch_run() {
   local label="$1"
   local url="$2"
   shift 2
-  local content=""
-
-  content=$(curl -fsSL --connect-timeout 5 --max-time 30 "$url" 2>/dev/null) || \
-  content=$(wget -qO- --timeout=30 "$url" 2>/dev/null)
-
-  if [ -z "$content" ]; then
-    echo "[!] Не удалось скачать скрипт для \"$label\" ($url) — таймаут или зеркало недоступно."
-    return 1
-  fi
 
   local tmp
   tmp=$(mktemp /tmp/vps-run-XXXXXX.sh) || {
     echo "[!] Не удалось создать временный файл в /tmp для \"$label\"" >&2
     return 1
   }
-  printf '%s\n' "$content" > "$tmp"
+
+  # Качаем сразу в файл (не через переменную bash): так скрипт сохраняется байт в байт
+  if ! { curl -fsSL --connect-timeout 5 --max-time 30 -o "$tmp" "$url" 2>/dev/null \
+         || wget -qO "$tmp" --timeout=30 "$url" 2>/dev/null; } \
+     || [ ! -s "$tmp" ]; then
+    echo "[!] Не удалось скачать скрипт для \"$label\" ($url) — таймаут или зеркало недоступно."
+    rm -f "$tmp"
+    return 1
+  fi
+
+  # Вместо скрипта мог прийти HTML (лендинг, страница ошибки) — не передаём его в bash
+  # (скрипт не может начинаться с "<", а HTML/XML — всегда)
+  if [ "$(head -c 200 "$tmp" | LC_ALL=C tr -d ' \t\r\n' | head -c 1)" = "<" ]; then
+    echo "[!] По ссылке вернулась HTML-страница, а не скрипт ($url) — проверь, что это прямая ссылка на скрипт."
+    rm -f "$tmp"
+    return 1
+  fi
+
   bash "$tmp" "$@"
   local rc=$?
   rm -f "$tmp"
@@ -166,7 +174,7 @@ menu() {
 4)  Geolocation     - в какой стране тебя видят сервисы (ipregion)
 5)  Censorcheck     - DNS resolvers (DoH/DoT) + доступность сайтов, DPI
 6)  Bench.sh        - CPU/диск (teddysun)
-7)  sysbench CPU    - однопоточный CPU-тест
+7)  sysbench CPU    - CPU в 1 поток и во все vCPU, сравнение (признак оверселлинга)
 8)  Globalping      - доступность ЭТОГО сервера с проверочных нод в РФ (ping+mtr)
 9)  Security Audit  - SSH-конфиг, firewall (ufw/iptables/nft), fail2ban/crowdsec, автообновления, открытые порты + оценка
 10) Disk & FS       - свободное место, inode, ошибки файловой системы
@@ -174,8 +182,12 @@ menu() {
 12) Geekbench       - только Geekbench (без fio/iperf3), для сравнения CPU между хостерами
 13) Censorcheck (geoblock) - не банит ли зарубежный сервис сам IP по гео (в отличие от 5 — DPI РФ)
 14) Nmap outbound   - не режет ли хостер исходящие порты (SMTP, DNS/DoT) — scanme.nmap.org, smtp.gmail.com, 1.1.1.1, 8.8.8.8
-15) Ookla Speedtest - скорость и пинг до ближайшего сервера Speedtest.net (официальный CLI)
-0)  Все по очереди (пункты 1-10, 13-15; 11 и 12 пропускаются — см. ниже)
+15) Speedtest до РФ - Speedtest-CLI до российских серверов (speedtest.artydev.ru)
+16) Speedtest СКФО  - Speedtest-CLI до серверов Северного Кавказа (storage.umager.ru)
+17) Instagram       - региональные ограничения Instagram по IP (storage.umager.ru)
+18) YouTube кластер - определение кластера YouTube (storage.umager.ru)
+19) Ookla Speedtest - скорость и пинг до ближайшего сервера Speedtest.net (официальный CLI)
+0)  Все по очереди (пункты 1-10, 13-15, 17, 18; 11, 12, 16 и 19 пропускаются — см. ниже)
 
 Запуск без аргументов, all и все — то же, что 0. В списке 0 тоже означает общий прогон: 0,11 example.com
 Диапазоны: bash vps-check.sh 2,4,5-7
@@ -187,7 +199,7 @@ menu() {
 Пункт 9 может предложить установить fail2ban, если его нет (только с твоего согласия; -y вопрос отключает)
 11 (SSL) нужен домен и не входит в общий прогон: bash vps-check.sh 11 example.com
 12 (Geekbench) не входит в общий прогон: bash vps-check.sh 12
-15 (Ookla): конкретный сервер — OOKLA_SERVER_ID=<id> bash vps-check.sh 15 (список: speedtest -L)
+19 (Ookla): конкретный сервер — OOKLA_SERVER_ID=<id> bash vps-check.sh 19 (список: speedtest -L)
 EOF
 }
 
@@ -199,7 +211,64 @@ cmd_4() { run "Geolocation Check" "fetch_run 'Geolocation' 'https://raw.githubus
 cmd_5() { run "Censorcheck (DPI mode)" "fetch_run 'Censorcheck' 'https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh' --mode dpi"; }
 cmd_13() { run "Censorcheck (geoblock mode)" "fetch_run 'Censorcheck geoblock' 'https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh' --mode geoblock --no-dns"; }
 cmd_6() { run "Bench.sh (Teddysun)" "fetch_run 'Bench.sh' 'https://bench.sh'"; }
-cmd_7() { run "sysbench CPU" "command -v sysbench >/dev/null || pkg_install sysbench; if command -v sysbench >/dev/null; then sysbench cpu run --threads=1; else echo '[i] sysbench не установлен, тест пропущен'; fi"; }
+cmd_7() {
+  echo -e "\n########## sysbench CPU ##########\n"
+  command -v sysbench >/dev/null || pkg_install sysbench
+  if ! command -v sysbench >/dev/null; then
+    echo "[i] sysbench не установлен, тест пропущен"
+    return
+  fi
+
+  local cores single multi s m ratio
+  cores=$(nproc 2>/dev/null || echo 1)
+
+  echo "--- 1 поток ---"
+  single=$(sysbench cpu run --threads=1 2>&1)
+  echo "$single"
+  s=$(echo "$single" | awk '/events per second:/ {print $4}')
+  if [ -z "$s" ]; then
+    echo
+    echo "[!] Не удалось разобрать результат sysbench (1 поток) — многопоточный прогон пропускаю."
+    return 1
+  fi
+
+  if [ "$cores" -le 1 ]; then
+    echo
+    echo "vCPU всего один — многопоточный тест не нужен."
+    return
+  fi
+
+  echo
+  echo "--- $cores потоков (по числу vCPU) ---"
+  multi=$(sysbench cpu run --threads="$cores" 2>&1)
+  echo "$multi"
+  m=$(echo "$multi" | awk '/events per second:/ {print $4}')
+
+  echo
+  echo "--- Масштабирование ---"
+  ratio=""
+  if [ -n "$s" ] && [ -n "$m" ]; then
+    ratio=$(awk -v s="$s" -v m="$m" 'BEGIN { if (s > 0) printf "%.2f", m / s }')
+  fi
+  if [ -z "$ratio" ]; then
+    echo "[!] Не удалось разобрать events per second из вывода sysbench — сравнить результаты не получилось."
+    return 1
+  fi
+  echo "events/sec: 1 поток = $s, $cores потоков = $m, прирост ×$ratio (идеал ≈ ×$cores)"
+  awk -v r="$ratio" -v c="$cores" 'BEGIN {
+    e = r / c
+    if (e >= 0.85)     print "Масштабирование хорошее: ядра отдают почти полную мощность."
+    else if (e >= 0.5) print "Масштабирование ниже идеала: возможно, vCPU — это потоки (SMT) одного ядра или процессор делится с соседями."
+    else               print "Масштабирование плохое: похоже на оверселлинг или жёсткий лимит CPU. Повтори тест в другое время суток."
+  }'
+  echo "(ориентир, а не приговор: результат зависит от SMT и нагрузки соседей по хосту)"
+}
+
+# Сторонние тесты: скачиваются во временный файл и запускаются через fetch_run
+cmd_15() { run "Speedtest до РФ (artydev)" "fetch_run 'Speedtest до РФ' 'https://speedtest.artydev.ru'"; }
+cmd_16() { run "Speedtest СКФО (umager)" "fetch_run 'Speedtest СКФО' 'https://storage.umager.ru/caucasus.sh'"; }
+cmd_17() { run "Instagram: региональные ограничения (umager)" "fetch_run 'Instagram' 'https://storage.umager.ru/checker_inst_ru.sh'"; }
+cmd_18() { run "YouTube: кластер (umager)" "fetch_run 'YouTube кластер' 'https://storage.umager.ru/yt.sh'"; }
 
 cmd_8() {
   echo -e "\n########## Globalping (доступность этого сервера из РФ) ##########\n"
@@ -719,7 +788,7 @@ cmd_14() {
 
 # Эталонные SHA-256 архивов Ookla Speedtest CLI (для версии из OOKLA_VERSION).
 # Пока значения пусты — проверка пропускается, а в выводе показывается сам хеш скачанного архива. Как заполнить — в README.
-# Для другой версии можно передать хеш напрямую: OOKLA_SHA256=<хеш> OOKLA_VERSION=<версия> bash vps-check.sh 15
+# Для другой версии можно передать хеш напрямую: OOKLA_SHA256=<хеш> OOKLA_VERSION=<версия> bash vps-check.sh 19
 ookla_expected_sha256() {   # $1 = архитектура (x86_64 | aarch64 | armhf | i386)
   if [ -n "${OOKLA_SHA256:-}" ]; then
     echo "$OOKLA_SHA256"
@@ -733,11 +802,11 @@ ookla_expected_sha256() {   # $1 = архитектура (x86_64 | aarch64 | ar
   esac
 }
 
-# ---------- 15. Ookla Speedtest ----------
+# ---------- 19. Ookla Speedtest (ближайший сервер) ----------
 # Официальный Speedtest CLI от Ookla. Бинарь скачивается архивом во временную
 # папку и удаляется после теста — в систему ничего не ставится.
-# Необязательно: OOKLA_SERVER_ID=<id> bash vps-check.sh 15  (список серверов: speedtest -L)
-cmd_15() {
+# Необязательно: OOKLA_SERVER_ID=<id> bash vps-check.sh 19  (список серверов: speedtest -L)
+cmd_19() {
   echo -e "\n########## Ookla Speedtest ##########\n"
   local st tmpdir="" arch url rc
   st=$(command -v speedtest)
@@ -866,7 +935,7 @@ generate_markdown_report() {
   local sec_score
   sec_score=$(grep -E "Оценка: [0-9]+/100" "$clean_file" | tail -1 | sed -E 's/.*Оценка: ([0-9]+\/100.*)/\1/')
 
-  # Итог Ookla Speedtest (если запускался пункт 15): берём только текст его раздела
+  # Итог Ookla Speedtest (если запускался пункт 19): берём только текст его раздела
   local ookla_block ookla_dl ookla_ul ookla_lat
   ookla_block=$(awk '/^########## Ookla Speedtest ##########$/ {f=1; next} /^########## / {f=0} f' "$clean_file")
   ookla_dl=$(printf '%s\n' "$ookla_block" | sed -nE 's/.*Download:[[:space:]]*([0-9.]+ [KMG]bps).*/\1/p' | head -1)
@@ -982,6 +1051,7 @@ dispatch() {
       for i in $DEFAULT_ITEMS; do "cmd_$i"; done
       echo -e "\n(пункт 11 — SSL Check — пропущен, нужен домен: bash vps-check.sh 11 example.com)"
       echo "(пункт 12 — Geekbench отдельно — пропущен, CPU уже покрыт пунктом 1 (YABS))"
+      echo "(пункты 16 — Speedtest СКФО — и 19 — Ookla — пропущены: запускай вручную)"
       ;;
     11)
       cmd_11 "$extra"
