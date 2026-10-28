@@ -143,11 +143,12 @@ fetch_run() {
   if command -v curl >/dev/null; then
     err=$(curl -fsSL --connect-timeout 5 --max-time 30 -o "$tmp" "$url" 2>&1) && ok=1
   fi
-  # wget — запасной вариант на случай, когда curl нет или он не справился с HTTPS. Если же curl не достучался
-  # до сайта вообще (DNS, соединение, таймаут), wget упрётся туда же — не тратим на него время.
+  # wget — запасной вариант на случай, когда curl нет или он не справился с HTTPS. Если curl не достучался
+  # до сайта (DNS, соединение, таймаут) или сервер ответил ошибкой HTTP (404, 403 — код 22), wget получит
+  # то же самое — не тратим на него время.
   # --tries=2: по умолчанию wget делает до 20 попыток, и на молчащем сайте пункт висел бы минутами
   local try_wget=1
-  case "$err" in *"(6)"*|*"(7)"*|*"(28)"*) try_wget=0 ;; esac
+  case "$err" in *"(6)"*|*"(7)"*|*"(22)"*|*"(28)"*) try_wget=0 ;; esac
   if [ "$ok" -eq 0 ] && [ "$try_wget" -eq 1 ] && command -v wget >/dev/null; then
     if werr=$(wget -nv --tries=2 -O "$tmp" --timeout=30 "$url" 2>&1); then
       ok=1
@@ -2151,11 +2152,16 @@ if [ -t 0 ] && [ "$NO_PROMPT" -eq 0 ]; then
 
   # 2. Согласие на Ookla: CLI принимает лицензию и сохраняет результаты у Ookla
   OOKLA_SEL=""
-  in_sel 6 && OOKLA_SEL="6"
-  in_sel 7 && OOKLA_SEL="${OOKLA_SEL:+$OOKLA_SEL и }7"
+  if in_sel 6 && in_sel 7; then
+    OOKLA_SEL="Пункты 6 и 7 меряют"
+  elif in_sel 6; then
+    OOKLA_SEL="Пункт 6 меряет"
+  elif in_sel 7; then
+    OOKLA_SEL="Пункт 7 меряет"
+  fi
   if [ -n "$OOKLA_SEL" ]; then
     echo
-    echo "Пункты $OOKLA_SEL меряют скорость официальным Speedtest от Ookla. При запуске принимается его лицензия,"
+    echo "$OOKLA_SEL скорость официальным Speedtest от Ookla. При запуске принимается его лицензия,"
     echo "а результаты сохраняются у Ookla на speedtest.net — как при обычном тесте на сайте."
     if ! ask_yn "Запускать Speedtest от Ookla?" y; then
       in_sel 6 && SKIP_REASON[6]="ты отказался от Speedtest от Ookla перед стартом"
@@ -2169,6 +2175,9 @@ if [ -t 0 ] && [ "$NO_PROMPT" -eq 0 ]; then
     PRE_F2B_INST=0 PRE_F2B_RUN=0 PRE_CS=0
     command -v fail2ban-client >/dev/null && PRE_F2B_INST=1
     { systemctl is-active --quiet fail2ban 2>/dev/null || pgrep -f fail2ban-server >/dev/null 2>&1; } && PRE_F2B_RUN=1
+    # Здесь проверка CrowdSec намеренно шире, чем в пункте 10 (там отдельно «установлен» и «запущен»):
+    # если от CrowdSec есть любой след — cscli, служба или процесс (например, в Docker), — fail2ban заранее
+    # не предлагаем. Блокирует ли CrowdSec атаки на самом деле, пункт 10 разберёт сам и при нужде спросит
     { command -v cscli >/dev/null || systemctl is-active --quiet crowdsec 2>/dev/null || pgrep -x crowdsec >/dev/null 2>&1; } && PRE_CS=1
     if [ "$PRE_F2B_INST" -eq 0 ] && [ "$PRE_CS" -eq 0 ]; then
       echo
