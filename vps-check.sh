@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
-# Полный чек-лист для проверки VPS перед/после покупки
+# Полный чек-лист для проверки VPS перед/после покупки.
+# 16 пунктов в пяти группах: machine (1-5), net (6-9), sec (10-11), ru (12-13), ip (14-16).
 # Запуск:
-#   bash vps-check.sh                      -> интерактивный запуск (пункты 1-10, 13-15, 17, 18)
-#   bash vps-check.sh -o report.txt        -> сохранить чистый TXT отчёт
-#   bash vps-check.sh -m report.md         -> сгенерировать форматированный Markdown
-#   bash vps-check.sh -o rep.txt -m rep.md -> сохранить оба отчёта сразу
-#   bash vps-check.sh -y 9                 -> без интерактивных вопросов (tmux, cron)
+#   bash vps-check.sh                      -> общий прогон: все 16 пунктов; всё нужное скрипт спросит перед стартом
+#   bash vps-check.sh net                  -> только группа «Сеть» (6-9); группы: machine, net, sec, ru, ip
+#   bash vps-check.sh sec,ru               -> несколько групп; можно смешивать с номерами: net,11
 #   bash vps-check.sh 3                    -> только пункт 3
-#   bash vps-check.sh 2,4,5-7              -> пункты 2, 4, 5, 6, 7
-#   bash vps-check.sh menu                 -> список пунктов
+#   bash vps-check.sh 2,4,6-9              -> пункты 2, 4, 6, 7, 8, 9
+#   bash vps-check.sh 11 example.com       -> SSL-проверка домена (без домена скрипт спросит его сам)
+#   bash vps-check.sh -o report.txt        -> сохранить чистый TXT отчёт (без -o/-m скрипт спросит про отчёт)
+#   bash vps-check.sh -m report.md         -> сгенерировать форматированный Markdown
+#   bash vps-check.sh -y 10                -> без вопросов (tmux, cron)
+#   bash vps-check.sh menu                 -> список пунктов и групп
+# Без скачивания — аргументы после скобки:
+#   bash <(curl -sL https://raw.githubusercontent.com/Yushapro10000/vps-check/main/vps-check.sh) net
 # Код возврата: 0 — все пункты прошли, 1 — хотя бы один пункт с ошибкой или неверные аргументы,
 #               130 — прогон прерван по Ctrl+C (отчёты всё равно сохраняются)
 
 MIN_ITEM=1
-MAX_ITEM=19
+MAX_ITEM=16
 
-# Пункты общего прогона (аргумент 0 / all / без аргументов). 11, 12, 16 и 19 — только вручную.
-DEFAULT_ITEMS="1 2 3 4 5 6 7 8 9 10 13 14 15 17 18"
+# Общий прогон (без аргументов, 0, all, все) — все пункты по порядку групп
+DEFAULT_ITEMS="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16"
 
 # Всё временное (скачанные скрипты, сырой лог, Ookla CLI, сводка) живёт в одной папке WORKDIR.
 # Она создаётся до запуска проверок и удаляется целиком при выходе, в том числе по Ctrl+C.
@@ -28,11 +33,22 @@ INTERRUPTED=0
 INTERRUPTED_ITEM=""
 FAILED=0
 STOP=0
+SELECTED_ITEMS=""
+# Пункты, которые пользователь отказался запускать (или для которых не хватило данных), и причина — для сводки
+declare -A SKIP_REASON=()
+# Ответы на вопросы про fail2ban, заданные перед стартом: y / n / пусто (тогда пункт 10 спросит сам)
+F2B_INSTALL_ANS=""
+F2B_START_ANS=""
 
-# Версия официального Speedtest CLI от Ookla (пункт 19). Если ссылка на скачивание
+# Версия официального Speedtest CLI от Ookla (пункты 6 и 7). Если ссылка на скачивание
 # перестала работать — проверь актуальную версию на https://www.speedtest.net/apps/cli
-# Переопределить без правки файла: OOKLA_VERSION=1.2.0 bash vps-check.sh 19
+# Переопределить без правки файла: OOKLA_VERSION=1.2.0 bash vps-check.sh 6
 OOKLA_VERSION="${OOKLA_VERSION:-1.2.0}"
+
+# Города для пункта 7 (Ookla до РФ): через запятую, по-английски, как в базе speedtest.net.
+# Через | — запасные написания одного города: если по первому серверов не нашлось, ищется следующее.
+# Свои города без правки файла: OOKLA_RU_CITIES="Moscow,Kazan" bash vps-check.sh 7
+OOKLA_RU_CITIES="${OOKLA_RU_CITIES:-Moscow,Saint Petersburg|St Petersburg|Petersburg,Yekaterinburg|Ekaterinburg,Novosibirsk}"
 
 # ---------- разбор флагов вывода (-o / -m) в любой позиции ----------
 OUTPUT_TXT=""
@@ -61,6 +77,15 @@ while [ $# -gt 0 ]; do
       NO_PROMPT=1
       shift
       ;;
+    vps-check|vps-check.sh)
+      # bash <(curl ...) vps-check 3-5: слово vps-check перед пунктами — по привычке от установленной команды
+      if [ "${#ARGS[@]}" -eq 0 ]; then
+        shift
+      else
+        ARGS+=("$1")
+        shift
+      fi
+      ;;
     *)
       ARGS+=("$1")
       shift
@@ -75,7 +100,7 @@ if [ -n "$OUTPUT_TXT" ] && [ "$OUTPUT_TXT" = "$OUTPUT_MD" ]; then
 fi
 
 if [ "${#ARGS[@]}" -gt 2 ]; then
-  echo "Слишком много аргументов. Несколько пунктов задаются через запятую (3,5,7), второй аргумент — только домен для пункта 11." >&2
+  echo "Слишком много аргументов. Несколько пунктов и групп задаются через запятую (3,5,net), второй аргумент — только домен для пункта 11." >&2
   exit 1
 fi
 
@@ -112,20 +137,65 @@ fetch_run() {
     return 1
   }
 
-  # Качаем сразу в файл (не через переменную bash): так скрипт сохраняется байт в байт
-  if ! { curl -fsSL --connect-timeout 5 --max-time 30 -o "$tmp" "$url" 2>/dev/null \
-         || wget -qO "$tmp" --timeout=30 "$url" 2>/dev/null; } \
-     || [ ! -s "$tmp" ]; then
-    echo "[!] Не удалось скачать скрипт для \"$label\" ($url) — таймаут или зеркало недоступно."
+  # Качаем сразу в файл (не через переменную bash): так скрипт сохраняется байт в байт.
+  # Текст ошибки curl/wget сохраняем: голое «не удалось скачать» не объясняет, что именно сломалось
+  local ok=0 err="" werr hint
+  if command -v curl >/dev/null; then
+    err=$(curl -fsSL --connect-timeout 5 --max-time 30 -o "$tmp" "$url" 2>&1) && ok=1
+  fi
+  # wget — запасной вариант на случай, когда curl нет или он не справился с HTTPS. Если же curl не достучался
+  # до сайта вообще (DNS, соединение, таймаут), wget упрётся туда же — не тратим на него время.
+  # --tries=2: по умолчанию wget делает до 20 попыток, и на молчащем сайте пункт висел бы минутами
+  local try_wget=1
+  case "$err" in *"(6)"*|*"(7)"*|*"(28)"*) try_wget=0 ;; esac
+  if [ "$ok" -eq 0 ] && [ "$try_wget" -eq 1 ] && command -v wget >/dev/null; then
+    if werr=$(wget -nv --tries=2 -O "$tmp" --timeout=30 "$url" 2>&1); then
+      ok=1
+    elif [ -z "$err" ]; then
+      err=$(printf '%s\n' "$werr" | tail -1)
+    fi
+  fi
+  if [ "$ok" -eq 0 ]; then
+    [ -z "$err" ] && err="нет ни curl, ни wget"
+    # Сначала коды curl, потом 404: в тексте таймаута бывает «after 5404 ms»
+    case "$err" in
+      *"(6)"*|*resolve*) hint="домен не находится в DNS — сайт, скорее всего, закрылся (или на VPS сломан DNS)" ;;
+      *"(7)"*|*refused*) hint="сайт не принимает соединения — он выключен или не пускает этот сервер" ;;
+      *"(28)"*|*"timed out"*) hint="сайт не ответил вовремя — он не работает или не пускает этот сервер (например, закрыт для зарубежных IP)" ;;
+      *"(35)"*|*"(60)"*|*SSL*|*certificate*) hint="проблема с HTTPS-сертификатом сайта" ;;
+      *404*) hint="по ссылке нет файла (404) — скрипт переехал или удалён" ;;
+      *403*) hint="доступ к файлу закрыт (403) — автор удалил его или закрыл хранилище" ;;
+      *"(22)"*|*"ERROR "[0-9]*) hint="сервер ответил ошибкой HTTP" ;;
+      *) hint="сайт недоступен" ;;
+    esac
+    echo "[!] Не удалось скачать скрипт для \"$label\" ($url): $hint."
+    echo "    Ошибка: $err"
     rm -f "$tmp"
+    [ -n "${WORKDIR:-}" ] && : > "$WORKDIR/fetch_failed"   # причина уже названа — run() не добавит общую фразу
+    return 1
+  fi
+  if [ ! -s "$tmp" ]; then
+    echo "[!] Скрипт для \"$label\" ($url) скачался пустым: сервер ответил пустой страницей — похоже, скрипта там больше нет."
+    rm -f "$tmp"
+    [ -n "${WORKDIR:-}" ] && : > "$WORKDIR/fetch_failed"   # причина уже названа — run() не добавит общую фразу
     return 1
   fi
 
-  # Вместо скрипта мог прийти HTML (лендинг, страница ошибки) — не передаём его в bash
+  # Вместо скрипта мог прийти HTML/XML (лендинг, страница ошибки, ответ S3-хранилища) — не передаём его в bash
   # (скрипт не может начинаться с "<", а HTML/XML — всегда)
   if [ "$(head -c 200 "$tmp" | LC_ALL=C tr -d ' \t\r\n' | head -c 1)" = "<" ]; then
-    echo "[!] По ссылке вернулась HTML-страница, а не скрипт ($url) — проверь, что это прямая ссылка на скрипт."
+    # Ошибка S3-хранилища выглядит как <Error><Code>AccessDenied</Code>...: достаём код
+    local s3code
+    s3code=$(head -c 4000 "$tmp" | tr -d '\r\n' | sed -n 's/.*<Code>\([^<]*\)<\/Code>.*/\1/p')
+    case "$s3code" in
+      "") echo "[!] По ссылке вернулась веб-страница (HTML/XML), а не скрипт ($url) — проверь, что это прямая ссылка на скрипт." ;;
+      AccessDenied) echo "[!] Хранилище ответило AccessDenied ($url) — автор удалил файл или закрыл к нему доступ. Это не проблема твоего VPS." ;;
+      NoSuchKey) echo "[!] Хранилище ответило NoSuchKey ($url) — файла по этой ссылке больше нет." ;;
+      NoSuchBucket) echo "[!] Хранилище ответило NoSuchBucket ($url) — самого хранилища больше нет." ;;
+      *) echo "[!] Хранилище ответило ошибкой $s3code ($url) — скрипт по ссылке недоступен." ;;
+    esac
     rm -f "$tmp"
+    [ -n "${WORKDIR:-}" ] && : > "$WORKDIR/fetch_failed"   # причина уже названа — run() не добавит общую фразу
     return 1
   fi
 
@@ -135,24 +205,37 @@ fetch_run() {
   return "$rc"
 }
 
+# $1 — заголовок, $2 — команда; дальше (необязательно) — утилиты, без которых сторонний скрипт не стартует.
+# Недостающие ставятся заранее, а если поставить не вышло — пункт пропускается с понятным сообщением.
 run() {
-  echo -e "\n########## $1 ##########\n"
-  bash -c "set -o pipefail; $2"
-  local rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "[!] Пункт \"$1\" завершился с ошибкой (код $rc) — сеть моргнула, источник недоступен, или что-то ещё пошло не так. Часть данных выше может отсутствовать."
+  local title="$1" cmd="$2"
+  shift 2
+  echo -e "\n########## $title ##########\n"
+  if [ $# -gt 0 ] && ! ensure_cmds "$@"; then
+    mark_skipped
+    return 0
+  fi
+  [ -n "${WORKDIR:-}" ] && rm -f "$WORKDIR/fetch_failed"
+  bash -c "set -o pipefail; $cmd"
+  local rc=$? explained=0
+  if [ -n "${WORKDIR:-}" ] && [ -e "$WORKDIR/fetch_failed" ]; then
+    explained=1
+    rm -f "$WORKDIR/fetch_failed"
+  fi
+  if [ "$rc" -ne 0 ] && [ "$explained" -eq 0 ]; then
+    echo "[!] Пункт \"$title\" завершился с ошибкой (код $rc) — сеть моргнула, источник недоступен, или что-то ещё пошло не так. Часть данных выше может отсутствовать."
   fi
   return "$rc"
 }
 
 pkg_install() {
-  local pkg="$1"
+  local pkgs=("$@")
   local sudo_cmd=""
   if [ "$(id -u)" -ne 0 ]; then
     if command -v sudo >/dev/null; then
       sudo_cmd="sudo"
     else
-      echo "[!] Нет root и нет sudo — установить '$pkg' невозможно." >&2
+      echo "[!] Нет root и нет sudo — установить '${pkgs[*]}' невозможно." >&2
       return 1
     fi
   fi
@@ -176,19 +259,19 @@ pkg_install() {
     done
     [ "$updated" -eq 0 ] && echo "[i] apt-get update не удался (нет сети до зеркал или apt всё ещё занят) — пробую установить без обновления индексов."
     # env внутри sudo: так DEBIAN_FRONTEND доходит до apt, даже если sudo сбрасывает окружение
-    $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -q "$pkg"
+    $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -q "${pkgs[@]}"
   elif command -v dnf >/dev/null; then
     $sudo_cmd dnf makecache -q 2>/dev/null
-    $sudo_cmd dnf install -y "$pkg"
+    $sudo_cmd dnf install -y "${pkgs[@]}"
   elif command -v yum >/dev/null; then
     $sudo_cmd yum makecache -q 2>/dev/null
-    $sudo_cmd yum install -y "$pkg"
+    $sudo_cmd yum install -y "${pkgs[@]}"
   elif command -v apk >/dev/null; then
-    $sudo_cmd apk add --no-cache "$pkg"
+    $sudo_cmd apk add --no-cache "${pkgs[@]}"
   elif command -v pacman >/dev/null; then
-    $sudo_cmd pacman -S --noconfirm "$pkg"
+    $sudo_cmd pacman -S --noconfirm "${pkgs[@]}"
   else
-    echo "Не нашёл apt/dnf/yum/apk/pacman — поставь '$pkg' вручную для своего дистрибутива."
+    echo "Не нашёл apt/dnf/yum/apk/pacman — поставь '${pkgs[*]}' вручную для своего дистрибутива."
     return 1
   fi
 }
@@ -209,16 +292,46 @@ run_with_timeout() {
 
 # Установка без простыни лога пакетного менеджера в отчёте: при успехе — одна строка, при сбое — хвост лога
 pkg_install_quiet() {
-  local pkg="$1" out rc
-  echo "Устанавливаю $pkg (может занять пару минут)..."
-  out=$(pkg_install "$pkg" </dev/null 2>&1)
+  local out rc
+  echo "Устанавливаю $* (может занять пару минут)..."
+  out=$(pkg_install "$@" </dev/null 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ]; then
     printf '%s\n' "$out" | tail -15
-    echo "[!] Не удалось установить $pkg."
+    echo "[!] Не удалось установить $*."
     return "$rc"
   fi
-  echo "Пакет $pkg установлен."
+  if [ $# -eq 1 ]; then
+    echo "Пакет $1 установлен."
+  else
+    echo "Пакеты установлены: $*."
+  fi
+}
+
+# Пакет, в котором лежит команда: у ping имя пакета разное в разных дистрибутивах
+pkg_for_cmd() {
+  case "$1" in
+    ping) if command -v apt-get >/dev/null; then echo "iputils-ping"; else echo "iputils"; fi ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Ставит недостающие команды одной установкой. 0 — всё на месте, 1 — чего-то так и нет
+ensure_cmds() {
+  local cmd pkgs=() still=()
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null || pkgs+=("$(pkg_for_cmd "$cmd")")
+  done
+  [ ${#pkgs[@]} -eq 0 ] && return 0
+  echo "Для этого пункта нужны: $* — недостающее ставлю."
+  pkg_install_quiet "${pkgs[@]}"
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null || still+=("$cmd")
+  done
+  if [ ${#still[@]} -gt 0 ]; then
+    echo "[!] Так и нет: ${still[*]} — без них сторонний скрипт не запустится, пункт пропущен."
+    return 1
+  fi
 }
 
 # Экспорт нужен только функциям, которые вызываются внутри `bash -c` из run()
@@ -227,77 +340,163 @@ export -f strip_ansi
 
 menu() {
   cat <<'EOF'
-1)  YABS            - CPU/RAM/диск (fio)/сеть (iperf3, зарубеж), включая Geekbench
-2)  RU Speedtest    - iperf3 до городов РФ (itdoginfo)
-3)  IP Quality      - ASN, risk score, доступность сервисов, блэклисты (check.place)
-4)  Geolocation     - в какой стране тебя видят сервисы (ipregion)
-5)  Censorcheck     - DNS resolvers (DoH/DoT) + доступность сайтов, DPI
-6)  Bench.sh        - CPU/диск (teddysun)
-7)  sysbench CPU    - CPU в 1 поток и во все vCPU, сравнение (признак оверселлинга)
-8)  Globalping      - доступность ЭТОГО сервера с проверочных нод в РФ (ping+mtr)
-9)  Security Audit  - SSH, firewall, Docker в обход firewall, fail2ban/CrowdSec, автообновления, опасные порты + оценка
-10) Disk & FS       - свободное место, inode, ошибки файловой системы
-11) SSL Check       - срок сертификата, сколько дней осталось, цепочка доверия (нужен аргумент-домен)
-12) Geekbench       - только Geekbench (без fio/iperf3), для сравнения CPU между хостерами
-13) Censorcheck (geoblock) - не банит ли зарубежный сервис сам IP по гео (в отличие от 5 — DPI РФ)
-14) Nmap outbound   - не режет ли хостер исходящие порты (SMTP, DNS/DoT) — scanme.nmap.org, Google, 1.1.1.1, 8.8.8.8
-15) Speedtest до РФ - Speedtest-CLI до российских серверов (speedtest.artydev.ru)
-16) Speedtest СКФО  - Speedtest-CLI до серверов Северного Кавказа (storage.umager.ru)
-17) Instagram       - региональные ограничения Instagram по IP (storage.umager.ru)
-18) YouTube кластер - определение кластера YouTube (storage.umager.ru)
-19) Ookla Speedtest - скорость и пинг до ближайшего сервера Speedtest.net (бывший пункт 15)
-0)  Все по очереди (пункты 1-10, 13-15, 17, 18; 11, 12, 16 и 19 пропускаются — см. ниже)
+Машина (machine): CPU, память, диск
+  1)  YABS             - диск (fio), сеть (iperf3, зарубеж) и Geekbench; если в запуске есть 4, Geekbench идёт там
+  2)  Bench.sh         - CPU/диск, компактный вывод (teddysun)
+  3)  sysbench CPU     - CPU в 1 поток и во все vCPU, сравнение (признак оверселлинга)
+  4)  Geekbench        - только Geekbench, для сравнения CPU между хостерами (5-10 минут)
+  5)  Disk & FS        - свободное место, inode, swap, ошибки файловой системы
+Сеть (net): скорость и исходящие порты
+  6)  Ookla Speedtest  - скорость и пинг до ближайшего сервера Speedtest.net
+  7)  Ookla до РФ      - Ookla до серверов в Москве, Петербурге, Екатеринбурге, Новосибирске
+  8)  iperf3 до РФ     - iperf3 до городов РФ (itdoginfo)
+  9)  Nmap outbound    - не режет ли хостер исходящие порты (SMTP, DNS/DoT)
+Безопасность (sec)
+  10) Security Audit   - SSH, firewall, Docker, fail2ban/CrowdSec, автообновления, опасные порты + оценка
+  11) SSL Check        - сертификат домена: срок, цепочка доверия (домен спросит, если не указан)
+Доступность из РФ (ru)
+  12) Globalping       - доступен ли ЭТОТ сервер с проверочных нод в РФ (ping + mtr)
+  13) Censorcheck DPI  - DNS-резолверы (DoH/DoT) и доступность сайтов, DPI-блокировки
+IP и сервисы (ip)
+  14) IP Quality       - ASN, risk score, доступность сервисов, блэклисты (check.place)
+  15) Geolocation      - в какой стране тебя видят сервисы (ipregion)
+  16) Censorcheck geo  - не банит ли зарубежный сервис сам IP по гео (в отличие от 13 — DPI РФ)
+0)  Общий прогон — все пункты по порядку (то же без аргументов, all или все)
 
-Запуск без аргументов, all и все — то же, что 0. В списке 0 тоже означает общий прогон: 0,11 example.com
-Диапазоны: bash vps-check.sh 2,4,5-7
-Вывод в файл (пишется после завершения всех проверок, а при Ctrl+C — по тому, что успело выполниться):
-  bash vps-check.sh -o report.txt 9          -> чистый текстовый файл
-  bash vps-check.sh -m report.md 9           -> форматированный Markdown
-  bash vps-check.sh -o rep.txt -m rep.md 0   -> оба формата сразу
-Без вопросов (tmux, cron): bash vps-check.sh -y 9
-Пункт 9 может предложить установить fail2ban, если его нет (только с твоего согласия; -y вопрос отключает)
-11 (SSL) нужен домен и не входит в общий прогон: bash vps-check.sh 11 example.com
-12 (Geekbench) не входит в общий прогон: bash vps-check.sh 12
-16 (Speedtest СКФО) не входит в общий прогон: bash vps-check.sh 16
-19 (Ookla): конкретный сервер — OOKLA_SERVER_ID=<id> bash vps-check.sh 19 (список: speedtest -L)
+Запуск:
+  bash vps-check.sh net               -> группа целиком; несколько групп: sec,ru; вместе с номерами: net,11
+  bash vps-check.sh 2,4,6-9           -> отдельные пункты и диапазоны
+  bash vps-check.sh 11 example.com    -> SSL-проверка домена
+Без скачивания — аргументы после скобки:
+  bash <(curl -sL https://raw.githubusercontent.com/Yushapro10000/vps-check/main/vps-check.sh) net
+Перед стартом скрипт сразу спрашивает всё нужное (домен для SSL, согласие на Ookla, fail2ban, отчёт) —
+дальше проверки идут без остановок, можно отойти.
+Отчёты пишутся после всех проверок (без флагов скрипт спросит сам):
+  -o report.txt  -> чистый текст        -m report.md  -> Markdown с таблицей-сводкой; можно оба
+Без вопросов (tmux, cron): -y — домен для 11 тогда передавай аргументом, fail2ban не ставится
+Ookla (6): конкретный сервер — OOKLA_SERVER_ID=<id> bash vps-check.sh 6 (список ближайших: speedtest -L)
+Ookla до РФ (7): свои города — OOKLA_RU_CITIES="Moscow,Kazan" bash vps-check.sh 7
+Вручную, без установки: Telegram-боты @dpi_checker_robot (DPI-блокировки) и @bschekbot (доступность и баны) —
+проверяют доступность с территории РФ
 EOF
+}
+
+# ---------- пункты: номер → группа, функция, имя ----------
+# Группы: machine — сама машина, net — сеть, sec — безопасность, ru — доступность из РФ, ip — IP и сервисы
+item_group() {
+  case "$1" in
+    1|2|3|4|5) echo "machine" ;;
+    6|7|8|9) echo "net" ;;
+    10|11) echo "sec" ;;
+    12|13) echo "ru" ;;
+    14|15|16) echo "ip" ;;
+  esac
+}
+
+group_items() {
+  case "$1" in
+    machine) echo "1 2 3 4 5" ;;
+    net) echo "6 7 8 9" ;;
+    sec) echo "10 11" ;;
+    ru) echo "12 13" ;;
+    ip) echo "14 15 16" ;;
+  esac
+}
+
+group_title() {
+  case "$1" in
+    machine) echo "Машина: CPU, память, диск (пункты 1-5)" ;;
+    net) echo "Сеть: скорость и исходящие порты (пункты 6-9)" ;;
+    sec) echo "Безопасность (пункты 10-11)" ;;
+    ru) echo "Доступность из РФ (пункты 12-13)" ;;
+    ip) echo "IP и сервисы (пункты 14-16)" ;;
+  esac
+}
+
+# Имя группы из аргумента — по-английски или по-русски; пусто, если это не группа
+group_by_name() {
+  case "$1" in
+    machine|hw|hardware|машина|Машина|железо) echo "machine" ;;
+    net|network|сеть|Сеть) echo "net" ;;
+    sec|security|безопасность|Безопасность) echo "sec" ;;
+    ru|rf|рф|РФ|россия|Россия) echo "ru" ;;
+    ip|IP|services|сервисы|Сервисы) echo "ip" ;;
+  esac
+}
+
+item_func() {
+  case "$1" in
+    1) echo "cmd_yabs" ;;
+    2) echo "cmd_bench" ;;
+    3) echo "cmd_sysbench" ;;
+    4) echo "cmd_geekbench" ;;
+    5) echo "cmd_disk" ;;
+    6) echo "cmd_ookla" ;;
+    7) echo "cmd_ookla_ru" ;;
+    8) echo "cmd_iperf_ru" ;;
+    9) echo "cmd_nmap" ;;
+    10) echo "cmd_audit" ;;
+    11) echo "cmd_ssl" ;;
+    12) echo "cmd_globalping" ;;
+    13) echo "cmd_censor_dpi" ;;
+    14) echo "cmd_ipquality" ;;
+    15) echo "cmd_geo" ;;
+    16) echo "cmd_geoblock" ;;
+  esac
 }
 
 # Короткие имена пунктов для итоговой сводки
 item_name() {
   case "$1" in
     1) echo "YABS" ;;
-    2) echo "RU Speedtest" ;;
-    3) echo "IP Quality" ;;
-    4) echo "Geolocation" ;;
-    5) echo "Censorcheck (DPI)" ;;
-    6) echo "Bench.sh" ;;
-    7) echo "sysbench CPU" ;;
-    8) echo "Globalping" ;;
-    9) echo "Security Audit" ;;
-    10) echo "Disk & FS" ;;
+    2) echo "Bench.sh" ;;
+    3) echo "sysbench CPU" ;;
+    4) echo "Geekbench" ;;
+    5) echo "Disk & FS" ;;
+    6) echo "Ookla Speedtest" ;;
+    7) echo "Ookla до РФ" ;;
+    8) echo "iperf3 до РФ" ;;
+    9) echo "Nmap outbound" ;;
+    10) echo "Security Audit" ;;
     11) echo "SSL Check" ;;
-    12) echo "Geekbench" ;;
-    13) echo "Censorcheck (geoblock)" ;;
-    14) echo "Nmap outbound" ;;
-    15) echo "Speedtest до РФ" ;;
-    16) echo "Speedtest СКФО" ;;
-    17) echo "Instagram" ;;
-    18) echo "YouTube кластер" ;;
-    19) echo "Ookla Speedtest" ;;
+    12) echo "Globalping" ;;
+    13) echo "Censorcheck (DPI)" ;;
+    14) echo "IP Quality" ;;
+    15) echo "Geolocation" ;;
+    16) echo "Censorcheck (geoblock)" ;;
     *) echo "Пункт $1" ;;
   esac
 }
 
-cmd_1() { run "YABS" "fetch_run 'YABS' 'https://yabs.sh'"; }
-cmd_12() { run "Geekbench (только CPU)" "fetch_run 'Geekbench' 'https://yabs.sh' -f -i"; }
-cmd_2() { run "RU Speedtest (itdoginfo)" "fetch_run 'RU Speedtest' 'https://raw.githubusercontent.com/itdoginfo/russian-iperf3-servers/main/speedtest.sh'"; }
-cmd_3() { run "IP Quality" "fetch_run 'IP Quality' 'https://ip.check.place' -l en"; }
-cmd_4() { run "Geolocation Check" "fetch_run 'Geolocation' 'https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh'"; }
-cmd_5() { run "Censorcheck (DPI mode)" "fetch_run 'Censorcheck' 'https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh' --mode dpi"; }
-cmd_13() { run "Censorcheck (geoblock mode)" "fetch_run 'Censorcheck geoblock' 'https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh' --mode geoblock --no-dns"; }
-cmd_6() { run "Bench.sh (Teddysun)" "fetch_run 'Bench.sh' 'https://bench.sh'"; }
-cmd_7() {
+# Подсказка про Telegram-ботов: независимая проверка с территории РФ, без установки чего-либо на сервер
+tg_bots_hint() {
+  echo
+  echo "[i] Сверить доступность с территории РФ вручную, без установки чего-либо на сервер, можно Telegram-ботами:"
+  echo "    @dpi_checker_robot — проверка на DPI-блокировки, @bschekbot — проверка доступности и банов."
+}
+
+# YABS: диск (fio), сеть (iperf3) и Geekbench. Если в этом же запуске есть пункт 4, Geekbench отдаётся ему (-g),
+# чтобы не гонять один и тот же долгий тест дважды
+cmd_yabs() {
+  local yabs_args=""
+  case " $SELECTED_ITEMS " in
+    *" 4 "*) yabs_args="-g" ;;
+  esac
+  if [ -n "$yabs_args" ]; then
+    run "YABS" "echo '(Geekbench в этом запуске идёт отдельным пунктом 4, поэтому здесь YABS запускается без него)'; echo; fetch_run 'YABS' 'https://yabs.sh' $yabs_args"
+  else
+    run "YABS" "fetch_run 'YABS' 'https://yabs.sh'"
+  fi
+}
+cmd_geekbench() { run "Geekbench (только CPU)" "fetch_run 'Geekbench' 'https://yabs.sh' -f -i"; }
+# Скрипт itdoginfo без iperf3, jq, awk и ping сразу выходит с ошибкой — ставим их заранее
+cmd_iperf_ru() { run "iperf3 до городов РФ (itdoginfo)" "fetch_run 'iperf3 до РФ' 'https://raw.githubusercontent.com/itdoginfo/russian-iperf3-servers/main/speedtest.sh'" iperf3 jq awk ping; }
+cmd_ipquality() { run "IP Quality" "fetch_run 'IP Quality' 'https://ip.check.place' -l en"; }
+cmd_geo() { run "Geolocation Check" "fetch_run 'Geolocation' 'https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh'"; }
+cmd_censor_dpi() { run "Censorcheck (DPI mode)" "fetch_run 'Censorcheck' 'https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh' --mode dpi"; }
+cmd_geoblock() { run "Censorcheck (geoblock mode)" "fetch_run 'Censorcheck geoblock' 'https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh' --mode geoblock --no-dns"; }
+cmd_bench() { run "Bench.sh (Teddysun)" "fetch_run 'Bench.sh' 'https://bench.sh'"; }
+cmd_sysbench() {
   echo -e "\n########## sysbench CPU ##########\n"
   command -v sysbench >/dev/null || pkg_install_quiet sysbench
   if ! command -v sysbench >/dev/null; then
@@ -351,13 +550,8 @@ cmd_7() {
   echo "(ориентир, а не приговор: результат зависит от SMT и нагрузки соседей по хосту)"
 }
 
-# Сторонние тесты: скачиваются во временный файл и запускаются через fetch_run
-cmd_15() { run "Speedtest до РФ (artydev)" "fetch_run 'Speedtest до РФ' 'https://speedtest.artydev.ru'"; }
-cmd_16() { run "Speedtest СКФО (umager)" "fetch_run 'Speedtest СКФО' 'https://storage.umager.ru/caucasus.sh'"; }
-cmd_17() { run "Instagram: региональные ограничения (umager)" "fetch_run 'Instagram' 'https://storage.umager.ru/checker_inst_ru.sh'"; }
-cmd_18() { run "YouTube: кластер (umager)" "fetch_run 'YouTube кластер' 'https://storage.umager.ru/yt.sh'"; }
 
-cmd_8() {
+cmd_globalping() {
   echo -e "\n########## Globalping (доступность этого сервера из РФ) ##########\n"
   local sudo_cmd="" MY_IP
   [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && sudo_cmd="sudo"
@@ -462,11 +656,11 @@ risky_listeners() {
 }
 
 # ---------- 9. Security Audit ----------
-cmd_9() {
+cmd_audit() {
   echo -e "\n########## Security Audit (чтение; установка fail2ban — только по согласию) ##########\n"
   local is_root=0
   [ "$(id -u)" -eq 0 ] && is_root=1
-  [ "$is_root" -eq 0 ] && echo "[!] Запущено не от root — ss/dmesg/iptables/nft/fail2ban-client могут отдать урезанный или пустой вывод. Для полной картины: sudo bash vps-check.sh 9"
+  [ "$is_root" -eq 0 ] && echo "[!] Запущено не от root — ss/dmesg/iptables/nft/fail2ban-client могут отдать урезанный или пустой вывод. Для полной картины: sudo bash vps-check.sh 10"
   echo
 
   # Все переменные пункта — local. Сейчас run_item и так запускает пункт в отдельном подшелле,
@@ -673,7 +867,7 @@ cmd_9() {
   fi
   if [ "$FW_ACTIVE" -eq 0 ]; then
     if [ "$is_root" -eq 0 ]; then
-      echo "Состояние firewall не удалось проверить без root (ufw, iptables и nft требуют права) — минус не засчитан. Для точной оценки: sudo bash vps-check.sh 9"
+      echo "Состояние firewall не удалось проверить без root (ufw, iptables и nft требуют права) — минус не засчитан. Для точной оценки: sudo bash vps-check.sh 10"
       FW_UNVERIFIED=1
     else
       echo "Активный firewall не обнаружен: ufw/firewalld неактивны, а в INPUT нет ни policy DROP, ни правил DROP/REJECT (правила Docker, fail2ban и CrowdSec firewall'ом не считаются)."
@@ -756,8 +950,13 @@ cmd_9() {
 
   # Вопрос «да/нет» с согласия пользователя. 0 — согласился, 1 — отказался,
   # 2 — нет терминала, 3 — вопросы отключены флагом -y
+  # $1 — вопрос, $2 — ответ, данный перед стартом (y/n); если он есть, второй раз не спрашиваем
   f2b_ask() {
     local ans
+    case "${2:-}" in
+      y) return 0 ;;
+      n) return 1 ;;
+    esac
     [ -t 0 ] || return 2
     [ "$NO_PROMPT" -eq 1 ] && return 3
     read -rp "$1 [y/N]: " ans
@@ -818,7 +1017,7 @@ cmd_9() {
   f2b_offer_install() {
     local hint rc
     hint=$(f2b_install_hint)
-    f2b_ask "Установить fail2ban сейчас? Будет поставлен пакет и запущена служба (изменение системы, нужен root или sudo)"
+    f2b_ask "Установить fail2ban сейчас? Будет поставлен пакет и запущена служба (изменение системы, нужен root или sudo)" "$F2B_INSTALL_ANS"
     rc=$?
     if [ "$rc" -ne 0 ]; then
       f2b_skip_msg "$rc" "установка пропущена" "$hint"
@@ -838,7 +1037,7 @@ cmd_9() {
       echo "Запустить без root и sudo нельзя. Вручную (от root): systemctl enable --now fail2ban"
       return
     fi
-    f2b_ask "Запустить fail2ban сейчас? Служба будет включена в автозагрузку и запущена (изменение системы, нужен root или sudo)"
+    f2b_ask "Запустить fail2ban сейчас? Служба будет включена в автозагрузку и запущена (изменение системы, нужен root или sudo)" "$F2B_START_ANS"
     rc=$?
     if [ "$rc" -ne 0 ]; then
       f2b_skip_msg "$rc" "запуск пропущен" "$hint"
@@ -1073,10 +1272,10 @@ cmd_9() {
 }
 
 # ---------- 10. Disk & Filesystem ----------
-cmd_10() {
+cmd_disk() {
   echo -e "\n########## Disk & Filesystem ##########\n"
   local SWAP_TOTAL RO_MOUNTS FS_ERRORS dev
-  [ "$(id -u)" -ne 0 ] && echo "[!] Запущено не от root — dmesg может вернуть пусто из-за kernel.dmesg_restrict. Для полной картины: sudo bash vps-check.sh 10"
+  [ "$(id -u)" -ne 0 ] && echo "[!] Запущено не от root — dmesg может вернуть пусто из-за kernel.dmesg_restrict. Для полной картины: sudo bash vps-check.sh 5"
   echo
 
   echo "=== Свободное место (df) ==="
@@ -1142,13 +1341,13 @@ cmd_10() {
 }
 
 # ---------- 11. SSL Check ----------
-cmd_11() {
+cmd_ssl() {
   local domain="${1:-$TARGET_DOMAIN}"
   echo -e "\n########## SSL Check ##########\n"
   if [ -z "$domain" ]; then
-    echo "Нужен домен: bash vps-check.sh 11 example.com"
+    echo "Домен не указан — пункт пропущен. Проверить потом: bash vps-check.sh 11 example.com"
     mark_skipped
-    return 1
+    return 0
   fi
 
   domain="${domain#*://}"
@@ -1245,7 +1444,7 @@ cmd_11() {
 }
 
 # ---------- 14. Nmap outbound ----------
-cmd_14() {
+cmd_nmap() {
   echo -e "\n########## Nmap outbound (не режет ли хостер исходящие порты) ##########\n"
   local MX_IP RELAY_IP
   command -v nmap >/dev/null || pkg_install_quiet nmap
@@ -1295,7 +1494,7 @@ cmd_14() {
 
 # Эталонные SHA-256 архивов Ookla Speedtest CLI (для версии из OOKLA_VERSION).
 # Пока значения пусты — проверка пропускается, а в выводе показывается сам хеш скачанного архива. Как заполнить — в README.
-# Для другой версии можно передать хеш напрямую: OOKLA_SHA256=<хеш> OOKLA_VERSION=<версия> bash vps-check.sh 19
+# Для другой версии можно передать хеш напрямую: OOKLA_SHA256=<хеш> OOKLA_VERSION=<версия> bash vps-check.sh 6
 ookla_expected_sha256() {   # $1 = архитектура (x86_64 | aarch64 | armhf | i386)
   if [ -n "${OOKLA_SHA256:-}" ]; then
     echo "$OOKLA_SHA256"
@@ -1309,95 +1508,233 @@ ookla_expected_sha256() {   # $1 = архитектура (x86_64 | aarch64 | ar
   esac
 }
 
-# ---------- 19. Ookla Speedtest (ближайший сервер) ----------
-# Официальный Speedtest CLI от Ookla. Бинарь скачивается архивом во временную
-# папку и удаляется после теста — в систему ничего не ставится.
-# Необязательно: OOKLA_SERVER_ID=<id> bash vps-check.sh 19  (список серверов: speedtest -L)
-cmd_19() {
-  echo -e "\n########## Ookla Speedtest ##########\n"
-  local st tmpdir="" arch url rc
+# ---------- Ookla Speedtest CLI: общий загрузчик для пунктов 6 и 7 ----------
+# Официальный CLI от Ookla. Если в системе уже есть speedtest от Ookla — берётся он, иначе архив скачивается
+# во временную папку внутри WORKDIR (её удалит общая очистка, в том числе по Ctrl+C) — в систему ничего не ставится.
+# Путь к бинарю — в OOKLA_BIN (вызывающий пункт объявляет её local).
+# Код возврата: 0 — готово, 2 — архитектура не поддерживается, 1 — ошибка
+ookla_get_cli() {
+  local st tmpdir arch url
+  OOKLA_BIN=""
   st=$(command -v speedtest 2>/dev/null) || st=""
-
   # у python-speedtest-cli бинарь тоже называется speedtest, поэтому проверяем, что он от Ookla
-  if [ -z "$st" ] || ! "$st" --version 2>&1 | grep -qi ookla; then
-    case "$(uname -m)" in
-      x86_64)        arch="x86_64" ;;
-      aarch64|arm64) arch="aarch64" ;;
-      armv7l)        arch="armhf" ;;
-      i386|i686)     arch="i386" ;;
-      *)
-        echo "[i] Для архитектуры $(uname -m) у Ookla нет официального CLI (есть x86_64, i386, armhf, aarch64) — пропускаю пункт."
-        mark_skipped
-        return
-        ;;
-    esac
+  if [ -n "$st" ] && "$st" --version 2>&1 | grep -qi ookla; then
+    OOKLA_BIN="$st"
+    return 0
+  fi
 
-    # Папка внутри WORKDIR: если тест прервут по Ctrl+C, её удалит общая очистка
-    tmpdir=$(mktemp -d "${WORKDIR:-${TMPDIR:-/tmp}}/ookla-XXXXXX") || {
+  case "$(uname -m)" in
+    x86_64)        arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    armv7l)        arch="armhf" ;;
+    i386|i686)     arch="i386" ;;
+    *)
+      echo "[i] Для архитектуры $(uname -m) у Ookla нет официального CLI (есть x86_64, i386, armhf, aarch64) — пропускаю пункт."
+      return 2
+      ;;
+  esac
+
+  # Папка внутри WORKDIR: если тест прервут по Ctrl+C, её удалит общая очистка.
+  # Она общая для пунктов 6 и 7: CLI скачивается за прогон один раз, второй пункт берёт готовый
+  if [ -n "${WORKDIR:-}" ]; then
+    tmpdir="$WORKDIR/ookla-cli"
+    if [ -x "$tmpdir/speedtest" ]; then
+      OOKLA_BIN="$tmpdir/speedtest"
+      return 0
+    fi
+    mkdir -p "$tmpdir" || {
       echo "[!] Не удалось создать временную папку для Ookla CLI" >&2
       return 1
     }
-
-    url="https://install.speedtest.net/app/cli/ookla-speedtest-${OOKLA_VERSION}-linux-${arch}.tgz"
-    local tgz="$tmpdir/ookla.tgz"
-    if ! { curl -fsSL --connect-timeout 5 --max-time 30 -o "$tgz" "$url" 2>/dev/null \
-           || wget -qO "$tgz" --timeout=30 "$url" 2>/dev/null; } \
-       || [ ! -s "$tgz" ]; then
-      echo "[!] Не удалось скачать Ookla Speedtest CLI ($url) — сеть недоступна или версия в ссылке устарела (поменяй OOKLA_VERSION в начале скрипта)."
-      rm -rf "$tmpdir"
+  else
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/ookla-XXXXXX") || {
+      echo "[!] Не удалось создать временную папку для Ookla CLI" >&2
       return 1
-    fi
-
-    # Проверка SHA-256 архива (если эталон известен); хеш считаем всегда, чтобы показать его при пустом эталоне
-    local want got
-    want=$(ookla_expected_sha256 "$arch" | tr 'A-F' 'a-f' | tr -d '[:space:]')
-    if command -v sha256sum >/dev/null; then
-      got=$(sha256sum "$tgz" | awk '{print $1}')
-    elif command -v shasum >/dev/null; then
-      got=$(shasum -a 256 "$tgz" | awk '{print $1}')
-    else
-      got=""
-    fi
-    if [ -n "$want" ]; then
-      if [ -z "$got" ]; then
-        echo "[i] sha256sum/shasum не найдены — проверка SHA-256 архива пропущена."
-      elif [ "$got" != "$want" ]; then
-        echo "[!] SHA-256 архива Ookla CLI не совпал (ожидался $want, получен $got) — запускать не буду."
-        rm -rf "$tmpdir"
-        return 1
-      else
-        echo "SHA-256 архива Ookla CLI совпал."
-      fi
-    elif [ -n "$got" ]; then
-      echo "[i] Для Ookla CLI $OOKLA_VERSION ($arch) эталонный SHA-256 не задан — проверка пропущена. Полученный хеш: $got (впиши его в ookla_expected_sha256, если доверяешь этому скачиванию)."
-    else
-      echo "[i] Для Ookla CLI $OOKLA_VERSION ($arch) эталонный SHA-256 не задан, а sha256sum/shasum не найдены — проверка целостности архива пропущена."
-    fi
-
-    if ! tar xzf "$tgz" -C "$tmpdir" 2>/dev/null || [ ! -x "$tmpdir/speedtest" ]; then
-      echo "[!] Не удалось распаковать архив Ookla CLI."
-      rm -rf "$tmpdir"
-      return 1
-    fi
-    st="$tmpdir/speedtest"
+    }
   fi
+
+  url="https://install.speedtest.net/app/cli/ookla-speedtest-${OOKLA_VERSION}-linux-${arch}.tgz"
+  local tgz="$tmpdir/ookla.tgz"
+  if ! { curl -fsSL --connect-timeout 5 --max-time 30 -o "$tgz" "$url" 2>/dev/null \
+         || wget -q --tries=2 -O "$tgz" --timeout=30 "$url" 2>/dev/null; } \
+     || [ ! -s "$tgz" ]; then
+    echo "[!] Не удалось скачать Ookla Speedtest CLI ($url) — сеть недоступна или версия в ссылке устарела (поменяй OOKLA_VERSION в начале скрипта)."
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  # Проверка SHA-256 архива (если эталон известен); хеш считаем всегда, чтобы показать его при пустом эталоне
+  local want got
+  want=$(ookla_expected_sha256 "$arch" | tr 'A-F' 'a-f' | tr -d '[:space:]')
+  if command -v sha256sum >/dev/null; then
+    got=$(sha256sum "$tgz" | awk '{print $1}')
+  elif command -v shasum >/dev/null; then
+    got=$(shasum -a 256 "$tgz" | awk '{print $1}')
+  else
+    got=""
+  fi
+  if [ -n "$want" ]; then
+    if [ -z "$got" ]; then
+      echo "[i] sha256sum/shasum не найдены — проверка SHA-256 архива пропущена."
+    elif [ "$got" != "$want" ]; then
+      echo "[!] SHA-256 архива Ookla CLI не совпал (ожидался $want, получен $got) — запускать не буду."
+      rm -rf "$tmpdir"
+      return 1
+    else
+      echo "SHA-256 архива Ookla CLI совпал."
+    fi
+  elif [ -n "$got" ]; then
+    echo "[i] Для Ookla CLI $OOKLA_VERSION ($arch) эталонный SHA-256 не задан — проверка пропущена. Полученный хеш: $got (впиши его в ookla_expected_sha256, если доверяешь этому скачиванию)."
+  else
+    echo "[i] Для Ookla CLI $OOKLA_VERSION ($arch) эталонный SHA-256 не задан, а sha256sum/shasum не найдены — проверка целостности архива пропущена."
+  fi
+
+  if ! tar xzf "$tgz" -C "$tmpdir" 2>/dev/null || [ ! -x "$tmpdir/speedtest" ]; then
+    echo "[!] Не удалось распаковать архив Ookla CLI."
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  OOKLA_BIN="$tmpdir/speedtest"
+}
+
+# Понятное сообщение по коду возврата Ookla CLI ($1 — код, $2 — лимит в секундах, $3 — номер пункта)
+ookla_explain_rc() {
+  case "$1" in
+    126) echo "[!] Бинарь Ookla не запустился (код 126): похоже, временная папка лежит на разделе с noexec. Запусти так: mkdir -p ~/tmp && TMPDIR=~/tmp bash vps-check.sh $3" ;;
+    124) echo "[!] Тест Ookla не уложился в $2 секунд — сервер Speedtest перегружен или канал очень медленный." ;;
+    *) echo "[!] Ookla Speedtest завершился с ошибкой (код $1) — сеть моргнула или сервер Speedtest недоступен." ;;
+  esac
+}
+
+# ---------- 6. Ookla Speedtest (ближайший сервер) ----------
+# Ookla сам выбирает ближайший к VPS сервер. Конкретный: OOKLA_SERVER_ID=<id> bash vps-check.sh 6  (список: speedtest -L)
+cmd_ookla() {
+  echo -e "\n########## Ookla Speedtest ##########\n"
+  local OOKLA_BIN rc
+  ookla_get_cli
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    mark_skipped
+    return 0
+  fi
+  [ "$rc" -ne 0 ] && return "$rc"
 
   local st_args=(--accept-license --accept-gdpr --progress=no)
   [ -n "${OOKLA_SERVER_ID:-}" ] && st_args+=(-s "$OOKLA_SERVER_ID")
-
-  run_with_timeout 180 "$st" "${st_args[@]}"
+  run_with_timeout 180 "$OOKLA_BIN" "${st_args[@]}"
   rc=$?
-
-  [ -n "$tmpdir" ] && rm -rf "$tmpdir"
-
-  if [ "$rc" -eq 126 ]; then
-    echo "[!] Бинарь Ookla не запустился (код 126): похоже, временная папка лежит на разделе с noexec. Запусти так: mkdir -p ~/tmp && TMPDIR=~/tmp bash vps-check.sh 19"
-    return "$rc"
-  fi
   if [ "$rc" -ne 0 ]; then
-    echo "[!] Пункт \"Ookla Speedtest\" завершился с ошибкой (код $rc) — сеть моргнула, сервер Speedtest недоступен или тест не уложился в 180 секунд."
+    ookla_explain_rc "$rc" 180 6
     return "$rc"
   fi
+}
+
+# ---------- 7. Ookla Speedtest до серверов в России ----------
+# Для зарубежного VPS ближайший сервер Ookla — не российский, поэтому серверы в нужных городах ищем поиском
+# speedtest.net (тем же, что в «Сменить сервер» на сайте) и тестируем каждый явно через -s <id>.
+# На город — до двух серверов: популярные бывают перегружены и отказывают. Города — в OOKLA_RU_CITIES (начало файла)
+cmd_ookla_ru() {
+  echo -e "\n########## Ookla Speedtest до РФ ##########\n"
+  if ! ensure_cmds jq; then
+    mark_skipped
+    return 0
+  fi
+  local OOKLA_BIN rc
+  ookla_get_cli
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    mark_skipped
+    return 0
+  fi
+  [ "$rc" -ne 0 ] && return "$rc"
+
+  local -a cities variants
+  local entry variant list cands sid sponsor sname out res row msg ok line
+  local good=0 total=0 summary="" api_err=""
+  IFS=',' read -ra cities <<< "$OOKLA_RU_CITIES"
+  for entry in "${cities[@]}"; do
+    entry=$(printf '%s' "$entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -z "$entry" ] && continue
+    total=$((total + 1))
+
+    # Ищем серверы по каждому написанию города, пока не найдутся российские.
+    # Фильтр по стране обязателен: «Moscow» есть и в США (Айдахо)
+    cands=""
+    api_err=""
+    IFS='|' read -ra variants <<< "$entry"
+    for variant in "${variants[@]}"; do
+      if ! list=$(curl -fsS --connect-timeout 5 --max-time 15 -G "https://www.speedtest.net/api/js/servers" \
+            --data-urlencode "engine=js" --data-urlencode "https_functional=true" \
+            --data-urlencode "limit=20" --data-urlencode "search=$variant" 2>&1); then
+        api_err="$list"
+        continue
+      fi
+      cands=$(printf '%s' "$list" | jq -r '
+        [ .[]? | select((.cc // "") == "RU" or (.country // "") == "Russia" or (.country // "") == "Russian Federation") ]
+        | .[:2][] | "\(.id)\t\(.sponsor // "?")\t\(.name // "?")"' 2>/dev/null)
+      [ -n "$cands" ] && break
+    done
+    if [ -z "$cands" ]; then
+      if [ -n "$api_err" ]; then
+        echo "[!] ${variants[0]}: не удалось получить список серверов speedtest.net — $api_err"
+      else
+        echo "[!] ${variants[0]}: на speedtest.net не нашлось российских серверов с таким городом (написание — по-английски)."
+      fi
+      summary="${summary:+$summary; }${variants[0]} — нет серверов"
+      continue
+    fi
+
+    ok=0
+    while IFS=$'\t' read -r sid sponsor sname; do
+      echo "Тестирую $sname — $sponsor (сервер $sid), до 90 секунд..."
+      out=$(run_with_timeout 90 "$OOKLA_BIN" --accept-license --accept-gdpr --format=json -s "$sid" </dev/null 2>&1)
+      rc=$?
+      if [ "$rc" -eq 126 ]; then
+        ookla_explain_rc 126 90 7
+        return 126
+      fi
+      res=$(printf '%s\n' "$out" | grep -F '"type":"result"' | tail -1)
+      row=""
+      if [ -n "$res" ]; then
+        row=$(printf '%s' "$res" | jq -r '[
+            (.download.bandwidth * 8 / 1000000), (.upload.bandwidth * 8 / 1000000),
+            (.ping.latency // 0), (.ping.jitter // 0), (.packetLoss // -1)
+          ] | @tsv' 2>/dev/null)
+      fi
+      if [ -n "$row" ]; then
+        # LC_ALL=C: точка в дробях при любой локали. Первая строка — подробно, вторая — для итога
+        line=$(printf '%s\t%s\t%s\n' "$sname" "$sponsor" "$row" | LC_ALL=C awk -F'\t' '{
+          loss = ($7 < 0) ? "н/д" : sprintf("%.1f%%", $7)
+          printf "%s — %s: ↓ %.1f Мбит/с, ↑ %.1f Мбит/с, пинг %.1f мс (джиттер %.1f мс), потери %s\n", $1, $2, $3, $4, $5, $6, loss
+          printf "%s ↓%.0f/↑%.0f Мбит/с, %.0f мс\n", $1, $3, $4, $5
+        }')
+        echo "  $(printf '%s\n' "$line" | head -1)"
+        summary="${summary:+$summary; }$(printf '%s\n' "$line" | tail -1)"
+        good=$((good + 1))
+        ok=1
+        break
+      fi
+      msg=$(printf '%s\n' "$out" | jq -rR 'fromjson? | select(.type? == "log") | .message? // empty' 2>/dev/null | tail -1)
+      [ -z "$msg" ] && [ "$rc" -eq 124 ] && msg="не уложился в 90 секунд"
+      [ -z "$msg" ] && msg=$(printf '%s\n' "$out" | tail -1)
+      echo "  не вышло: ${msg:-сервер не ответил}"
+    done <<< "$cands"
+    [ "$ok" -eq 0 ] && summary="${summary:+$summary; }${variants[0]} — не вышло"
+  done
+
+  echo
+  if [ "$total" -eq 0 ]; then
+    echo "[!] Список городов OOKLA_RU_CITIES пуст."
+    return 1
+  fi
+  echo "Итог Ookla до РФ: $summary"
+  if [ "$good" -eq 0 ]; then
+    echo "[!] Ни один город проверить не удалось."
+    return 1
+  fi
+  [ "$good" -lt "$total" ] && echo "[i] Проверено городов: $good из $total — для остальных серверы не нашлись или не ответили."
+  echo "(↓ — загрузка на VPS, ↑ — отдача с VPS; Ookla сохраняет результаты тестов у себя на speedtest.net)"
+  return 0
 }
 
 # ---------- итоговая сводка ----------
@@ -1460,22 +1797,26 @@ generate_markdown_report() {
   local sec_score
   sec_score=$(grep -E "Оценка: [0-9]+/100" "$clean_file" | tail -1 | sed -E 's/.*Оценка: ([0-9]+\/100.*)/\1/')
 
-  # Geekbench — из YABS (пункт 1) или пункта 12
+  # Geekbench — из YABS (пункт 1) или пункта 4
   local gb_ver gb_single gb_multi
   gb_ver=$(sed -nE 's/^Geekbench ([0-9]+) Benchmark Test:.*/\1/p' "$clean_file" | head -1)
   gb_single=$(sed -nE 's/^[[:space:]]*Single Core[[:space:]]*\|[[:space:]]*([0-9]+).*/\1/p' "$clean_file" | head -1)
   gb_multi=$(sed -nE 's/^[[:space:]]*Multi Core[[:space:]]*\|[[:space:]]*([0-9]+).*/\1/p' "$clean_file" | head -1)
 
-  # Масштабирование sysbench (пункт 7)
+  # Масштабирование sysbench (пункт 3)
   local sb_scale
   sb_scale=$(sed -nE 's/.*прирост ×([0-9.]+) \(идеал ≈ ×([0-9]+)\).*/×\1 при идеале ×\2/p' "$clean_file" | head -1)
 
-  # Итог Ookla Speedtest (если запускался пункт 19): берём только текст его раздела
+  # Итог Ookla Speedtest (если запускался пункт 6): берём только текст его раздела
   local ookla_block ookla_dl ookla_ul ookla_lat
   ookla_block=$(awk '/^########## Ookla Speedtest ##########$/ {f=1; next} /^########## / {f=0} f' "$clean_file")
   ookla_dl=$(printf '%s\n' "$ookla_block" | sed -nE 's/.*Download:[[:space:]]*([0-9.]+ [KMG]bps).*/\1/p' | head -1)
   ookla_ul=$(printf '%s\n' "$ookla_block" | sed -nE 's/.*Upload:[[:space:]]*([0-9.]+ [KMG]bps).*/\1/p' | head -1)
   ookla_lat=$(printf '%s\n' "$ookla_block" | sed -nE 's/.*Latency:[[:space:]]*([0-9.]+ ms).*/\1/p' | head -1)
+
+  # Итог Ookla до РФ (пункт 7) — он сам печатает готовую строку «Итог Ookla до РФ: ...»
+  local ookla_ru
+  ookla_ru=$(sed -n 's/^Итог Ookla до РФ: //p' "$clean_file" | tail -1)
 
   {
     cat <<EOF
@@ -1514,6 +1855,8 @@ EOF
       fi
     fi
 
+    [ -n "$ookla_ru" ] && echo "| **Ookla до РФ** | $ookla_ru |"
+
     # Сводка по пунктам — таблицей (в терминале и TXT она идёт отдельным разделом в конце)
     if [ -s "$SUMMARY_FILE" ]; then
       echo
@@ -1533,12 +1876,24 @@ EOF
     fi
 
     echo -e "\n---\n"
-    echo "## Результаты проверок"
+    # Если пункты из нескольких групп — разделы идут по группам, общий заголовок не нужен
+    grep -q '^>>>>>>>>>> .* <<<<<<<<<<$' "$clean_file" || echo "## Результаты проверок"
 
     # Литерал ########## вместо #{10}: старый mawk (Debian 12, Ubuntu 22.04) не понимает {n} в регулярках.
     # Раздел «Итог прогона» пропускаем — он уже выведен таблицей выше.
     awk '
       BEGIN { in_block = 0 }
+      /^>>>>>>>>>> .+ <<<<<<<<<<$/ {
+        if (in_block) {
+          print "```\n"
+        }
+        g = $0
+        sub(/^>>>>>>>>>> /, "", g)
+        sub(/ <<<<<<<<<<$/, "", g)
+        print "\n## " g "\n"
+        in_block = 0
+        next
+      }
       /^########## .+ ##########$/ {
         if (in_block) {
           print "```\n"
@@ -1573,48 +1928,60 @@ EOF
   return "$rc"
 }
 
-# ---------- разбор аргументов 2,4,5-7 ----------
+# ---------- разбор выборки: номера, диапазоны, группы ----------
+# Части через запятую: 3, 6-9, 0/all/все (всё), имя группы (net, сеть, ...). Повторы схлопываются
 expand_selection() {
   local input="$1"
-  local result=""
+  local result="" part i g start end
+  local -a parts
+  add_item() {
+    case " $result " in *" $1 "*) return ;; esac
+    result="$result $1"
+  }
   IFS=',' read -ra parts <<< "$input"
   for part in "${parts[@]}"; do
     part="${part// /}"
-    if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-      local start="${BASH_REMATCH[1]}"
-      local end="${BASH_REMATCH[2]}"
+    [ -z "$part" ] && continue
+    g=$(group_by_name "$part")
+    if [ -n "$g" ]; then
+      for i in $(group_items "$g"); do add_item "$i"; done
+    elif [ "$part" = "0" ] || [ "$part" = "all" ] || [ "$part" = "все" ]; then
+      for i in $DEFAULT_ITEMS; do add_item "$i"; done
+    elif [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
       if [ "$start" -gt "$end" ]; then
         echo "Пропускаю некорректный диапазон $part (начало больше конца)" >&2
         continue
       fi
       [ "$start" -lt "$MIN_ITEM" ] && { echo "Диапазон $part выходит за $MIN_ITEM-$MAX_ITEM, обрезаю до $MIN_ITEM" >&2; start=$MIN_ITEM; }
       [ "$end" -gt "$MAX_ITEM" ] && { echo "Диапазон $part выходит за $MIN_ITEM-$MAX_ITEM, обрезаю до $MAX_ITEM" >&2; end=$MAX_ITEM; }
-      if [ "$start" -le 11 ] && [ "$end" -ge 11 ]; then
-        echo "Внимание: диапазон $part включает пункт 11 (SSL Check) — нужен домен вторым аргументом" >&2
-      fi
-      if [ "$start" -le 12 ] && [ "$end" -ge 12 ]; then
-        echo "Внимание: диапазон $part включает пункт 12 (Geekbench) — это долгий тест (5-10 минут)" >&2
-      fi
-      for ((i=start; i<=end; i++)); do
-        case " $result " in *" $i "*) continue ;; esac
-        result="$result $i"
-      done
-    elif [ "$part" = "0" ]; then
-      # 0 внутри списка — общий прогон (например, 0,11 example.com)
-      for i in $DEFAULT_ITEMS; do
-        case " $result " in *" $i "*) continue ;; esac
-        result="$result $i"
-      done
+      for ((i=start; i<=end; i++)); do add_item "$i"; done
     elif [[ "$part" =~ ^[0-9]+$ ]]; then
       if [ "$part" -lt "$MIN_ITEM" ] || [ "$part" -gt "$MAX_ITEM" ]; then
         echo "Пункта $part не существует (доступны $MIN_ITEM-$MAX_ITEM), пропускаю" >&2
         continue
       fi
-      case " $result " in *" $part "*) continue ;; esac
-      result="$result $part"
+      add_item "$part"
     fi
   done
   echo "$result"
+}
+
+# Части выборки, которые не похожи ни на номер, ни на диапазон, ни на группу (для понятной ошибки)
+bad_selection_parts() {
+  local part bad=""
+  local -a parts
+  IFS=',' read -ra parts <<< "$1"
+  for part in "${parts[@]}"; do
+    part="${part// /}"
+    [ -z "$part" ] && continue
+    [ -n "$(group_by_name "$part")" ] && continue
+    case "$part" in 0|all|все) continue ;; esac
+    [[ "$part" =~ ^[0-9]+(-[0-9]+)?$ ]] && continue
+    bad="${bad:+$bad, }$part"
+  done
+  echo "$bad"
 }
 
 # ---------- диспетчер запусков ----------
@@ -1634,10 +2001,17 @@ run_item() {
   printf '%s %s\n' "$n" "$start" > "$WORKDIR/current"
   # trap внутри подшелла: если команда пункта (nmap, YABS) сама поймала Ctrl+C и вышла «нормально»,
   # bash без трапа пошёл бы к следующей команде этого же пункта
-  if [ "$n" = "11" ]; then
-    ( trap 'exit 130' INT; cmd_11 "$extra" )
+  local fn
+  fn=$(item_func "$n")
+  if [ -n "${SKIP_REASON[$n]:-}" ]; then
+    # Пропуск, о котором договорились перед стартом: заголовок всё равно печатаем — так пункт виден и в отчёте
+    echo -e "\n########## $(item_name "$n") ##########\n"
+    echo "Пропущен: ${SKIP_REASON[$n]}"
+    : > "$WORKDIR/skip"
+  elif [ "$n" = "11" ]; then
+    ( trap 'exit 130' INT; "$fn" "$extra" )
   else
-    ( trap 'exit 130' INT; "cmd_$n" )
+    ( trap 'exit 130' INT; "$fn" )
   fi
   rc=$?
   if [ "$STOP" -eq 1 ]; then
@@ -1658,20 +2032,29 @@ run_item() {
 dispatch() {
   local mode="$1"
   local extra="$2"
-  local items n count=0 general=0
+  local items n g prev_group="" groups="" count=0
   FAILED=0
   # Флаг вместо смерти по сигналу: некоторые сторонние скрипты (например, YABS) сами ловят Ctrl+C
   # и выходят с кодом 0 — без флага прогон после этого просто шёл бы к следующему пункту
   STOP=0
   trap 'STOP=1' INT
-  case "$mode" in
-    ""|все|all|0) items="$DEFAULT_ITEMS"; general=1 ;;
-    11) items="11" ;;
-    *) items=$(expand_selection "$mode") ;;   # предупреждения («пункта 99 нет») видны пользователю
-  esac
+  items=$(expand_selection "${mode:-0}")   # предупреждения («пункта 99 нет») видны пользователю и попадают в лог
+  SELECTED_ITEMS="$items"
+
+  # Заголовки групп — только если в запуске пункты из разных групп
+  for n in $items; do
+    g=$(item_group "$n")
+    case " $groups " in *" $g "*) ;; *) groups="$groups $g" ;; esac
+  done
+  set -- $groups
 
   for n in $items; do
     [ "$STOP" -eq 1 ] && break
+    g=$(item_group "$n")
+    if [ $# -gt 1 ] && [ "$g" != "$prev_group" ]; then
+      printf '\n>>>>>>>>>> %s <<<<<<<<<<\n' "$(group_title "$g")"
+      prev_group="$g"
+    fi
     run_item "$n" "$extra"
     count=$((count + 1))
   done
@@ -1693,40 +2076,39 @@ dispatch() {
   if [ "$STOP" -eq 1 ]; then
     return 130
   fi
-  if [ "$general" -eq 1 ]; then
-    echo
-    echo "(пункт 11 — SSL Check — пропущен, нужен домен: bash vps-check.sh 11 example.com)"
-    echo "(пункт 12 — Geekbench отдельно — пропущен, CPU уже покрыт пунктом 1 (YABS))"
-    echo "(пункты 16 — Speedtest СКФО — и 19 — Ookla — пропущены: запускай вручную)"
-  fi
+  # Проверяли доступность из РФ — подсказываем, чем сверить результат снаружи
+  case " $items " in
+    *" 12 "*|*" 13 "*) tg_bots_hint ;;
+  esac
   [ "$FAILED" -eq 0 ]
 }
 
 # ---------- валидация аргументов и ранний выход ----------
 case "$ARG" in
-  menu|-h|--help)
+  menu|-h|--help|help|меню)
     menu
     exit 0
     ;;
-  ""|все|all|0|11)
-    : ;;
-  *[0-9]*)
-    if [[ ! "$ARG" =~ ^[0-9,-]+$ ]] || [ -z "$(expand_selection "$ARG" 2>/dev/null)" ]; then
-      echo "Неизвестный или некорректный аргумент: $ARG" >&2
-      menu
-      exit 1
-    fi
-    ;;
-  *)
-    echo "Неизвестный аргумент: $ARG" >&2
-    menu
-    exit 1
-    ;;
 esac
+
+BAD_PARTS=$(bad_selection_parts "${ARG:-0}")
+if [ -n "$BAD_PARTS" ]; then
+  echo "Неизвестный аргумент: $BAD_PARTS. Пункты — номера 1-$MAX_ITEM и диапазоны (6-9), группы — machine, net, sec, ru, ip." >&2
+  echo >&2
+  menu
+  exit 1
+fi
+SEL=$(expand_selection "${ARG:-0}" 2>/dev/null)
+if [ -z "$SEL" ]; then
+  echo "В выборке «$ARG» нет ни одного существующего пункта (доступны $MIN_ITEM-$MAX_ITEM)." >&2
+  echo >&2
+  menu
+  exit 1
+fi
 
 # Второй позиционный аргумент нужен только пункту 11
 if [ -n "$TARGET_DOMAIN" ]; then
-  case " $(expand_selection "$ARG" 2>/dev/null) " in
+  case " $SEL " in
     *" 11 "*) : ;;
     *) echo "[i] Второй аргумент «$TARGET_DOMAIN» используется только пунктом 11 (SSL) и будет проигнорирован. Несколько пунктов задаются через запятую: 3,5" >&2 ;;
   esac
@@ -1737,15 +2119,75 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-# ---------- интерактивные вопросы (только если запуск в реальном TTY) ----------
-CACHE_AND_SHOW=false
-if [ -t 0 ] && [ "$NO_PROMPT" -eq 0 ]; then
-  read -rp "Кэшировать вывод и показать его ещё раз одним куском в конце? [y/N]: " CACHE_ANS
-  [[ "$CACHE_ANS" =~ ^[Yy] ]] && CACHE_AND_SHOW=true
+in_sel() {
+  case " $SEL " in *" $1 "*) return 0 ;; esac
+  return 1
+}
 
-  # Если пути к файлам отчетов не были переданы через флаги CLI — спрашиваем интерактивно
+# Вопрос «да/нет» с ответом по умолчанию ($2 — y или n). 0 — да
+ask_yn() {
+  local ans hint="[y/N]"
+  [ "$2" = "y" ] && hint="[Y/n]"
+  read -rp "$1 $hint: " ans
+  [ -z "$ans" ] && ans="$2"
+  [[ "$ans" =~ ^[YyДд] ]]
+}
+
+# ---------- вопросы перед стартом (только в настоящем терминале и без -y) ----------
+# Всё, что нужно от пользователя, спрашиваем сразу: дальше проверки идут без остановок, и можно отойти
+CACHE_AND_SHOW=false
+ASKED=0
+if [ -t 0 ] && [ "$NO_PROMPT" -eq 0 ]; then
+  echo "Перед стартом — несколько вопросов, дальше проверки пойдут без остановок (можно отойти от терминала)."
+
+  # 1. Домен для SSL-проверки
+  if in_sel 11 && [ -z "$TARGET_DOMAIN" ]; then
+    echo
+    echo "Пункт 11 проверяет HTTPS-сертификат домена: сколько дней он ещё действует и доверяют ли ему браузеры."
+    echo "Нужен, если на этом сервере есть сайт, панель или подписка по домену. Домена нет — просто нажми Enter."
+    read -rp "Домен (например example.com) или Enter, чтобы пропустить: " TARGET_DOMAIN
+    TARGET_DOMAIN="${TARGET_DOMAIN// /}"
+  fi
+
+  # 2. Согласие на Ookla: CLI принимает лицензию и сохраняет результаты у Ookla
+  OOKLA_SEL=""
+  in_sel 6 && OOKLA_SEL="6"
+  in_sel 7 && OOKLA_SEL="${OOKLA_SEL:+$OOKLA_SEL и }7"
+  if [ -n "$OOKLA_SEL" ]; then
+    echo
+    echo "Пункты $OOKLA_SEL меряют скорость официальным Speedtest от Ookla. При запуске принимается его лицензия,"
+    echo "а результаты сохраняются у Ookla на speedtest.net — как при обычном тесте на сайте."
+    if ! ask_yn "Запускать Speedtest от Ookla?" y; then
+      in_sel 6 && SKIP_REASON[6]="ты отказался от Speedtest от Ookla перед стартом"
+      in_sel 7 && SKIP_REASON[7]="ты отказался от Speedtest от Ookla перед стартом"
+    fi
+  fi
+
+  # 3. fail2ban: если защиты от подбора паролей явно нет — спрашиваем сейчас, а не посреди прогона.
+  #    Неочевидные случаи (например, CrowdSec без bouncer'а) пункт 10 разберёт и спросит сам
+  if in_sel 10 && { [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null; }; then
+    PRE_F2B_INST=0 PRE_F2B_RUN=0 PRE_CS=0
+    command -v fail2ban-client >/dev/null && PRE_F2B_INST=1
+    { systemctl is-active --quiet fail2ban 2>/dev/null || pgrep -f fail2ban-server >/dev/null 2>&1; } && PRE_F2B_RUN=1
+    { command -v cscli >/dev/null || systemctl is-active --quiet crowdsec 2>/dev/null || pgrep -x crowdsec >/dev/null 2>&1; } && PRE_CS=1
+    if [ "$PRE_F2B_INST" -eq 0 ] && [ "$PRE_CS" -eq 0 ]; then
+      echo
+      echo "Пункт 10 проверяет защиту SSH от подбора паролей: на сервере нет ни fail2ban, ни CrowdSec."
+      echo "fail2ban банит IP, с которых подбирают пароль. Его можно поставить прямо во время проверки (меняет систему)."
+      if ask_yn "Поставить fail2ban во время проверки?" n; then F2B_INSTALL_ANS="y"; else F2B_INSTALL_ANS="n"; fi
+    elif [ "$PRE_F2B_INST" -eq 1 ] && [ "$PRE_F2B_RUN" -eq 0 ] && [ "$PRE_CS" -eq 0 ]; then
+      echo
+      echo "fail2ban установлен, но не запущен — SSH сейчас не защищён от подбора паролей."
+      if ask_yn "Запустить fail2ban во время проверки?" n; then F2B_START_ANS="y"; else F2B_START_ANS="n"; fi
+    fi
+  fi
+
+  # 4. Отчёт в файл, если не передан флагами
   if [ -z "$OUTPUT_TXT" ] && [ -z "$OUTPUT_MD" ]; then
-    read -rp "Сохранить отчёт в файл? [1: Нет (Enter), 2: TXT, 3: Markdown, 4: Оба]: " REP_ANS
+    echo
+    echo "Отчёт сохраняется в текущую папку после всех проверок. TXT — весь вывод простым текстом;"
+    echo "Markdown — то же плюс таблица-сводка сверху (ОС, CPU, оценки, скорости), удобно сравнивать VPS."
+    read -rp "Сохранить отчёт? [1: нет (Enter), 2: TXT, 3: Markdown, 4: оба]: " REP_ANS
     DATE_TAG=$(date +%Y%m%d-%H%M)
     case "$REP_ANS" in
       2) OUTPUT_TXT="vps-report-${DATE_TAG}.txt" ;;
@@ -1756,11 +2198,29 @@ if [ -t 0 ] && [ "$NO_PROMPT" -eq 0 ]; then
         ;;
     esac
   fi
+
+  # 5. Повтор лога — имеет смысл, только если пунктов несколько
+  set -- $SEL
+  if [ $# -gt 1 ]; then
+    echo
+    echo "Вывод длинный, и начало может уехать за пределы экрана."
+    ask_yn "Показать в конце весь вывод ещё раз одним куском?" n && CACHE_AND_SHOW=true
+  fi
+  ASKED=1
   echo
 fi
 
+# Без домена пункт 11 пропускается (в -y, cron, curl | bash спросить некому)
+if in_sel 11 && [ -z "$TARGET_DOMAIN" ]; then
+  if [ "$ASKED" -eq 1 ]; then
+    SKIP_REASON[11]="домен не указан. Проверить потом: bash vps-check.sh 11 example.com"
+  else
+    SKIP_REASON[11]="домен не передан, а спросить некому (нет терминала или флаг -y). Проверить: bash vps-check.sh 11 example.com"
+  fi
+fi
+
 # ---------- рабочая папка и очистка ----------
-# Учитывает TMPDIR: если /tmp смонтирован с noexec (пункт 19 запускает бинарь), можно указать другую папку
+# Учитывает TMPDIR: если /tmp смонтирован с noexec (пункты 6 и 7 запускают бинарь Ookla), можно указать другую папку
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/vps-check-XXXXXX") || {
   echo "Не удалось создать временную папку в ${TMPDIR:-/tmp} (диск переполнен или смонтирован в read-only)" >&2
   exit 1
@@ -1778,8 +2238,15 @@ trap cleanup EXIT
 # Ctrl+C прерывает проверки, но не сам скрипт: он допишет сводку и сохранит отчёты по тому, что успело выполниться.
 # tee -i игнорирует Ctrl+C, чтобы дописать в лог всё, что уже вывели проверки.
 trap 'INTERRUPTED=1' INT
-dispatch "$ARG" "$TARGET_DOMAIN" 2>&1 | tee -i "$TEMP_RAW"
-PIPE_RC=("${PIPESTATUS[@]}")   # оба кода сразу: PIPESTATUS сбрасывается следующей же командой
+if [ -t 0 ]; then
+  dispatch "$ARG" "$TARGET_DOMAIN" 2>&1 | tee -i "$TEMP_RAW"
+  PIPE_RC=("${PIPESTATUS[@]}")   # оба кода сразу: PIPESTATUS сбрасывается следующей же командой
+else
+  # stdin — не терминал (cron, curl | bash). При curl | bash в stdin лежит остаток ЭТОГО скрипта: если сторонний
+  # скрипт или утилита прочитают stdin, они его «съедят», и сводка с отчётами молча не выполнятся. Отдаём им /dev/null
+  dispatch "$ARG" "$TARGET_DOMAIN" </dev/null 2>&1 | tee -i "$TEMP_RAW"
+  PIPE_RC=("${PIPESTATUS[@]}")
+fi
 DISPATCH_RC=${PIPE_RC[0]}
 TEE_RC=${PIPE_RC[1]:-0}
 trap 'exit 130' INT
